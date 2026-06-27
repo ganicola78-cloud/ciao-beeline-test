@@ -42,4 +42,4 @@ public class MainActivity extends Activity {
         super.onPause();
         unregisterReceiver(receiver);
     }
-}
+    }
