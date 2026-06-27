@@ -1,0 +1,34 @@
+name: Build APKs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+      - name: Build debug APKs
+        run: gradle assembleDebug
+      - name: Upload mobile APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciao-beeline-mobile-debug-apk
+          path: mobile/build/outputs/apk/debug/*.apk
+      - name: Upload wear APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciao-beeline-wear-debug-apk
+          path: wear/build/outputs/apk/debug/*.apk
