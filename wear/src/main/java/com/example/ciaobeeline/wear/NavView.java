@@ -18,16 +18,18 @@ public class NavView extends View {
 
     private final Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint routePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint sideRoadPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint progressPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     private String mode = "WAIT";
     private String turn = "RIGHT";
     private int dist = 300;
     private int speed = 0;
 
-    // linea demo / default
+    // Linea demo/default
     private String line = "120,200;120,165;145,140;145,95;105,60";
 
     public NavView(Context c) {
@@ -42,6 +44,12 @@ public class NavView extends View {
         routePaint.setStrokeCap(Paint.Cap.ROUND);
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
+        sideRoadPaint.setStyle(Paint.Style.STROKE);
+        sideRoadPaint.setColor(Color.rgb(170, 170, 170));
+        sideRoadPaint.setStrokeWidth(3.5f);
+        sideRoadPaint.setStrokeCap(Paint.Cap.ROUND);
+        sideRoadPaint.setStrokeJoin(Paint.Join.ROUND);
+
         fillPaint.setStyle(Paint.Style.FILL);
         fillPaint.setColor(Color.WHITE);
 
@@ -53,6 +61,11 @@ public class NavView extends View {
 
         textPaint.setColor(Color.WHITE);
         textPaint.setTextAlign(Paint.Align.CENTER);
+
+        progressPaint.setStyle(Paint.Style.STROKE);
+        progressPaint.setColor(Color.rgb(210, 210, 210));
+        progressPaint.setStrokeWidth(4f);
+        progressPaint.setStrokeCap(Paint.Cap.ROUND);
     }
 
     public void update(String json) {
@@ -81,13 +94,14 @@ public class NavView extends View {
         c.scale(scale, scale);
         c.translate((w / scale - 240f) / 2f, (h / scale - 240f) / 2f);
 
-        // sfondo rotondo
         c.drawCircle(120, 120, 120, bgPaint);
 
         if ("WAIT".equals(mode)) {
             drawWait(c);
         } else if ("OFF_ROUTE".equals(mode)) {
             drawOffRoute(c);
+        } else if ("STOP".equals(mode)) {
+            drawStop(c);
         } else {
             drawNav(c);
         }
@@ -108,26 +122,40 @@ public class NavView extends View {
         c.drawText("apri app telefono", 120, 155, textPaint);
     }
 
-    private void drawOffRoute(Canvas c) {
+    private void drawStop(Canvas c) {
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         textPaint.setTextSize(22);
-        c.drawText("FUORI", 120, 80, textPaint);
-        c.drawText("TRACCIA", 120, 108, textPaint);
+        c.drawText("NAV", 120, 98, textPaint);
+        c.drawText("STOP", 120, 126, textPaint);
 
-        textPaint.setTextSize(46);
-        c.drawText("↖", 120, 155, textPaint);
+        textPaint.setTypeface(Typeface.DEFAULT);
+        textPaint.setTextSize(13);
+        c.drawText("avvia dal telefono", 120, 156, textPaint);
+    }
+
+    private void drawOffRoute(Canvas c) {
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextSize(20);
+        c.drawText("FUORI", 120, 76, textPaint);
+        c.drawText("TRACCIA", 120, 101, textPaint);
+
+        textPaint.setTextSize(48);
+        c.drawText("↖", 120, 153, textPaint);
 
         textPaint.setTextSize(22);
-        c.drawText(dist + " m", 120, 192, textPaint);
+        c.drawText(dist + " m", 120, 190, textPaint);
     }
 
     private void drawNav(Canvas c) {
-        // box più alto per evitare che la linea finisca sopra i numeri
-        RectF routeBox = new RectF(42, 28, 198, 118);
+        RectF routeBox = new RectF(34, 24, 206, 118);
 
-        drawRouteLine(c, routeBox);
+        ArrayList<PointF> screenPts = transformedLine(routeBox);
+
+        drawSideRoads(c, screenPts);
+        drawRoutePath(c, screenPts);
         drawTriangle(c, 120, 140, 16);
         drawBottom(c);
+        drawProgressArc(c);
 
         if ("REROUTE".equals(mode)) {
             textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
@@ -136,9 +164,89 @@ public class NavView extends View {
         }
     }
 
-    private void drawRouteLine(Canvas c, RectF box) {
-        ArrayList<PointF> pts = parseLine(line);
+    private void drawRoutePath(Canvas c, ArrayList<PointF> pts) {
         if (pts.size() < 2) return;
+
+        Path path = new Path();
+        path.moveTo(pts.get(0).x, pts.get(0).y);
+
+        for (int i = 1; i < pts.size(); i++) {
+            path.lineTo(pts.get(i).x, pts.get(i).y);
+        }
+
+        c.drawPath(path, routePaint);
+    }
+
+    private void drawSideRoads(Canvas c, ArrayList<PointF> pts) {
+        if (pts.size() < 3) return;
+
+        int drawn = 0;
+
+        for (int i = 1; i < pts.size() - 1 && drawn < 5; i += 2) {
+            PointF prev = pts.get(i - 1);
+            PointF cur = pts.get(i);
+            PointF next = pts.get(i + 1);
+
+            float vx = next.x - prev.x;
+            float vy = next.y - prev.y;
+
+            float len = (float) Math.sqrt(vx * vx + vy * vy);
+            if (len < 8f) continue;
+
+            vx /= len;
+            vy /= len;
+
+            float px = -vy;
+            float py = vx;
+
+            // Non disegnare laterali troppo in basso, per non coprire i numeri.
+            if (cur.y > 122) continue;
+
+            float sideLen = 26f;
+
+            // Alterna lato destro/sinistro per simulare incroci Beeline.
+            int sign = (i % 4 == 1) ? 1 : -1;
+
+            float x1 = cur.x;
+            float y1 = cur.y;
+            float x2 = cur.x + px * sideLen * sign;
+            float y2 = cur.y + py * sideLen * sign;
+
+            // Mantieni dentro il quadrante utile.
+            if (x2 < 22 || x2 > 218 || y2 < 20 || y2 > 128) continue;
+
+            c.drawLine(x1, y1, x2, y2, sideRoadPaint);
+
+            // Aggiunge una piccola seconda laterale sull'altro lato vicino alle curve,
+            // visivamente simile alle stradine secondarie nel Beeline.
+            if (Math.abs(angleAt(prev, cur, next)) > 22 && drawn < 4) {
+                float x3 = cur.x - px * 18f * sign;
+                float y3 = cur.y - py * 18f * sign;
+                if (x3 >= 22 && x3 <= 218 && y3 >= 20 && y3 <= 128) {
+                    c.drawLine(cur.x, cur.y, x3, y3, sideRoadPaint);
+                }
+            }
+
+            drawn++;
+        }
+    }
+
+    private float angleAt(PointF a, PointF b, PointF c) {
+        float a1 = (float) Math.atan2(b.y - a.y, b.x - a.x);
+        float a2 = (float) Math.atan2(c.y - b.y, c.x - b.x);
+        float d = (float) Math.toDegrees(a2 - a1);
+
+        while (d > 180) d -= 360;
+        while (d < -180) d += 360;
+
+        return d;
+    }
+
+    private ArrayList<PointF> transformedLine(RectF box) {
+        ArrayList<PointF> pts = parseLine(line);
+        ArrayList<PointF> out = new ArrayList<>();
+
+        if (pts.size() < 2) return out;
 
         float minX = pts.get(0).x;
         float maxX = pts.get(0).x;
@@ -163,21 +271,13 @@ public class NavView extends View {
         float offsetX = box.left + (box.width() - dstW) / 2f;
         float offsetY = box.top + (box.height() - dstH) / 2f;
 
-        Path path = new Path();
-
-        for (int i = 0; i < pts.size(); i++) {
-            PointF src = pts.get(i);
+        for (PointF src : pts) {
             float x = offsetX + (src.x - minX) * scale;
             float y = offsetY + (src.y - minY) * scale;
-
-            if (i == 0) {
-                path.moveTo(x, y);
-            } else {
-                path.lineTo(x, y);
-            }
+            out.add(new PointF(x, y));
         }
 
-        c.drawPath(path, routePaint);
+        return out;
     }
 
     private void drawTriangle(Canvas c, float cx, float cy, float halfWidth) {
@@ -194,18 +294,21 @@ public class NavView extends View {
     }
 
     private void drawBottom(Canvas c) {
-        // tutto più in alto
         float distY = 182f;
-        float speedY = 206f;
+        float speedY = 207f;
 
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(22);
+        textPaint.setTextSize(24);
         c.drawText(turnSymbol(turn) + " " + dist + " m", 120, distY, textPaint);
 
-        // velocità ingrandita circa come la riga dei metri
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         textPaint.setTextSize(22);
         c.drawText(speed + " km/h", 120, speedY, textPaint);
+    }
+
+    private void drawProgressArc(Canvas c) {
+        RectF arc = new RectF(55, 162, 185, 230);
+        c.drawArc(arc, 160, 55, false, progressPaint);
     }
 
     private String turnSymbol(String t) {
@@ -231,4 +334,4 @@ public class NavView extends View {
         }
         return out;
     }
-    }
+}
