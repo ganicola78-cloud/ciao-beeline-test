@@ -41,11 +41,11 @@ public class MainActivity extends Activity {
     private static final String PREF_DESTINATION = "destination_text";
 
     // V0.3 road-test tuning
-    private static final double OFF_ROUTE_RECALC_METERS = 30.0;
-    private static final double OFF_ROUTE_WARN_METERS = 45.0;
-    private static final long RECALC_COOLDOWN_MS = 5000;
-    private static final long PERIODIC_RECALC_MS = 120000;
-    private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
+    private static final double OFF_ROUTE_RECALC_METERS = 22.0;
+    private static final double OFF_ROUTE_WARN_METERS = 35.0;
+    private static final long RECALC_COOLDOWN_MS = 3000;
+    private static final long PERIODIC_RECALC_MS = 60000;
+    private static final float GPS_BEARING_MIN_SPEED_KMH = 14.0f;
 
     private EditText apiKeyEdit;
     private EditText destinationEdit;
@@ -327,7 +327,9 @@ public class MainActivity extends Activity {
 
         String body = "{\"coordinates\":[[" +
                 currentLocation.getLongitude() + "," + currentLocation.getLatitude() + "],[" +
-                dest.lon + "," + dest.lat + "]]}";
+                dest.lon + "," + dest.lat + "]]," +
+                "\"preference\":\"shortest\"," +
+                "\"options\":{\"avoid_features\":[\"highways\",\"tollways\"]}}";
 
         try (OutputStream os = c.getOutputStream()) {
             os.write(body.getBytes(StandardCharsets.UTF_8));
@@ -358,7 +360,7 @@ public class MainActivity extends Activity {
         if (currentLocation == null) return;
 
         long now = System.currentTimeMillis();
-        if (!recalculated && now - lastSendMs < 800) return;
+        if (!recalculated && now - lastSendMs < 500) return;
         lastSendMs = now;
 
         ArrayList<LatLon> copy;
