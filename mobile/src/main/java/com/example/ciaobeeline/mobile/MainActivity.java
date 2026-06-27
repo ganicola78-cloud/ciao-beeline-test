@@ -2,6 +2,7 @@ package com.example.ciaobeeline.mobile;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationListener;
@@ -28,15 +29,18 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 
 public class MainActivity extends Activity {
     private static final String PATH = "/nav_update";
+    private static final String PREFS = "ciao_beeline_prefs";
+    private static final String PREF_API_KEY = "ors_api_key";
+    private static final String PREF_DESTINATION = "destination_text";
 
     private EditText apiKeyEdit;
-    private EditText destLatEdit;
-    private EditText destLonEdit;
+    private EditText destinationEdit;
     private TextView status;
 
     private LocationManager locationManager;
@@ -48,6 +52,8 @@ public class MainActivity extends Activity {
     private boolean running = false;
     private long lastRouteMs = 0;
     private double offRouteMeters = 9999;
+    private LatLon lastDestination = null;
+    private String lastDestinationText = "";
 
     @Override
     public void onCreate(Bundle b) {
@@ -68,30 +74,33 @@ public class MainActivity extends Activity {
         apiKeyEdit.setHint("OpenRouteService API key");
         root.addView(apiKeyEdit);
 
-        destLatEdit = new EditText(this);
-        destLatEdit.setHint("Destinazione latitudine es. 45.4642");
-        root.addView(destLatEdit);
-
-        destLonEdit = new EditText(this);
-        destLonEdit.setHint("Destinazione longitudine es. 9.1900");
-        root.addView(destLonEdit);
+        destinationEdit = new EditText(this);
+        destinationEdit.setHint("Destinazione es. Via Roma, Cagliari");
+        root.addView(destinationEdit);
 
         Button start = new Button(this);
         start.setText("Start live routing");
         root.addView(start);
+
+        Button stop = new Button(this);
+        stop.setText("Stop");
+        root.addView(stop);
 
         Button test = new Button(this);
         test.setText("Invia demo al Carlyle");
         root.addView(test);
 
         status = new TextView(this);
-        status.setText("Pronto. Installa anche l'app Wear sul Carlyle.");
+        status.setText("Pronto. Inserisci API key una sola volta e una destinazione.");
         status.setTextSize(16);
         root.addView(status);
 
         setContentView(root);
 
+        loadPrefs();
+
         start.setOnClickListener(v -> startRouting());
+        stop.setOnClickListener(v -> stopRouting());
         test.setOnClickListener(v -> sendDemo());
 
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
@@ -99,8 +108,28 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void loadPrefs() {
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        apiKeyEdit.setText(p.getString(PREF_API_KEY, ""));
+        destinationEdit.setText(p.getString(PREF_DESTINATION, ""));
+    }
+
+    private void savePrefs() {
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(PREF_API_KEY, apiKeyEdit.getText().toString().trim())
+                .putString(PREF_DESTINATION, destinationEdit.getText().toString().trim())
+                .apply();
+    }
+
     private void startRouting() {
+        savePrefs();
         running = true;
+        route.clear();
+        lastDestination = null;
+        lastDestinationText = "";
+        lastRouteMs = 0;
+        offRouteMeters = 9999;
 
         try {
             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
@@ -108,10 +137,42 @@ public class MainActivity extends Activity {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1000, 1, listener);
             }
 
-            status.setText("Live routing avviato. Attendo GPS...");
+            Location lastGps = null;
+            Location lastNetwork = null;
+
+            try {
+                lastGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                lastNetwork = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            } catch (SecurityException ignored) {
+            }
+
+            currentLocation = bestLocation(lastGps, lastNetwork);
+
+            if (currentLocation != null) {
+                status.setText("GPS già disponibile. Calcolo rotta...");
+                requestRoute();
+            } else {
+                status.setText("Live routing avviato. Attendo GPS del telefono...");
+            }
         } catch (Exception e) {
             status.setText("GPS errore: " + e.getMessage());
         }
+    }
+
+    private Location bestLocation(Location a, Location b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        return a.getTime() >= b.getTime() ? a : b;
+    }
+
+    private void stopRouting() {
+        running = false;
+        try {
+            locationManager.removeUpdates(listener);
+        } catch (Exception ignored) {
+        }
+        status.setText("Navigazione fermata.");
+        sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"line\":\"120,200;120,80\"}");
     }
 
     private final LocationListener listener = loc -> {
@@ -132,66 +193,36 @@ public class MainActivity extends Activity {
         if (currentLocation == null) return;
 
         final String key = apiKeyEdit.getText().toString().trim();
+        final String destinationText = destinationEdit.getText().toString().trim();
+
+        savePrefs();
 
         if (key.length() < 8) {
             status.setText("Inserisci API key OpenRouteService.");
             return;
         }
 
-        final double destLat;
-        final double destLon;
-
-        try {
-            destLat = Double.parseDouble(destLatEdit.getText().toString().trim());
-            destLon = Double.parseDouble(destLonEdit.getText().toString().trim());
-        } catch (Exception e) {
-            status.setText("Inserisci lat/lon destinazione valide. Usa il punto, non la virgola.");
+        if (destinationText.length() < 3) {
+            status.setText("Inserisci una destinazione, es. Via Roma, Cagliari.");
             return;
         }
 
         lastRouteMs = System.currentTimeMillis();
-        status.setText("Calcolo rotta online...");
+        status.setText("Cerco destinazione e calcolo rotta...");
 
         new Thread(() -> {
             try {
-                URL url = new URL("https://api.openrouteservice.org/v2/directions/driving-car/geojson");
+                LatLon dest;
 
-                HttpURLConnection c = (HttpURLConnection) url.openConnection();
-                c.setRequestMethod("POST");
-                c.setDoOutput(true);
-                c.setRequestProperty("Authorization", key);
-                c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-
-                String body = "{\"coordinates\":[[" +
-                        currentLocation.getLongitude() + "," +
-                        currentLocation.getLatitude() + "],[" +
-                        destLon + "," +
-                        destLat + "]]}";
-
-                try (OutputStream os = c.getOutputStream()) {
-                    os.write(body.getBytes(StandardCharsets.UTF_8));
+                if (lastDestination != null && destinationText.equals(lastDestinationText)) {
+                    dest = lastDestination;
+                } else {
+                    dest = geocodeDestination(key, destinationText);
+                    lastDestination = dest;
+                    lastDestinationText = destinationText;
                 }
 
-                InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
-                String txt = readAll(is);
-
-                if (c.getResponseCode() >= 400) {
-                    throw new RuntimeException(txt);
-                }
-
-                JSONObject json = new JSONObject(txt);
-                JSONArray coords = json
-                        .getJSONArray("features")
-                        .getJSONObject(0)
-                        .getJSONObject("geometry")
-                        .getJSONArray("coordinates");
-
-                ArrayList<LatLon> newRoute = new ArrayList<>();
-
-                for (int i = 0; i < coords.length(); i++) {
-                    JSONArray p = coords.getJSONArray(i);
-                    newRoute.add(new LatLon(p.getDouble(1), p.getDouble(0)));
-                }
+                ArrayList<LatLon> newRoute = requestDirections(key, dest);
 
                 synchronized (route) {
                     route.clear();
@@ -199,7 +230,7 @@ public class MainActivity extends Activity {
                 }
 
                 handler.post(() -> {
-                    status.setText("Rotta ricevuta: " + newRoute.size() + " punti");
+                    status.setText("Rotta ricevuta per: " + destinationText + " - punti: " + newRoute.size());
                     sendNavUpdate(true);
                 });
 
@@ -207,6 +238,82 @@ public class MainActivity extends Activity {
                 handler.post(() -> status.setText("Routing errore: " + e.getMessage()));
             }
         }).start();
+    }
+
+    private LatLon geocodeDestination(String key, String destinationText) throws Exception {
+        String encoded = URLEncoder.encode(destinationText, "UTF-8");
+        URL url = new URL("https://api.openrouteservice.org/geocode/search?api_key=" + key + "&text=" + encoded + "&size=1");
+
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestMethod("GET");
+        c.setRequestProperty("Accept", "application/json");
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+
+        if (c.getResponseCode() >= 400) {
+            throw new RuntimeException("Geocoding: " + txt);
+        }
+
+        JSONObject json = new JSONObject(txt);
+        JSONArray features = json.getJSONArray("features");
+
+        if (features.length() == 0) {
+            throw new RuntimeException("Destinazione non trovata. Prova con indirizzo più preciso, es. Via Roma, Cagliari, Italia.");
+        }
+
+        JSONArray coords = features
+                .getJSONObject(0)
+                .getJSONObject("geometry")
+                .getJSONArray("coordinates");
+
+        double lon = coords.getDouble(0);
+        double lat = coords.getDouble(1);
+
+        return new LatLon(lat, lon);
+    }
+
+    private ArrayList<LatLon> requestDirections(String key, LatLon dest) throws Exception {
+        URL url = new URL("https://api.openrouteservice.org/v2/directions/driving-car/geojson");
+
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Authorization", key);
+        c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+
+        String body = "{\"coordinates\":[[" +
+                currentLocation.getLongitude() + "," +
+                currentLocation.getLatitude() + "],[" +
+                dest.lon + "," +
+                dest.lat + "]]}";
+
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+
+        if (c.getResponseCode() >= 400) {
+            throw new RuntimeException(txt);
+        }
+
+        JSONObject json = new JSONObject(txt);
+        JSONArray coords = json
+                .getJSONArray("features")
+                .getJSONObject(0)
+                .getJSONObject("geometry")
+                .getJSONArray("coordinates");
+
+        ArrayList<LatLon> newRoute = new ArrayList<>();
+
+        for (int i = 0; i < coords.length(); i++) {
+            JSONArray p = coords.getJSONArray(i);
+            newRoute.add(new LatLon(p.getDouble(1), p.getDouble(0)));
+        }
+
+        return newRoute;
     }
 
     private void sendNavUpdate(boolean recalculated) {
@@ -482,4 +589,5 @@ public class MainActivity extends Activity {
             lon = b;
         }
     }
-                        }
+    }
+            
