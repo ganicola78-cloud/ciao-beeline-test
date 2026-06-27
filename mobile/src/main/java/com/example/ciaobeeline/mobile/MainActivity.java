@@ -532,4 +532,18 @@ public class MainActivity extends Activity {
 
             int sx = (int) Math.round(120 + x * 0.55);
             int sy = (int) Math.round(200 - y * 0.55);
-            sx = 
+            sx = Math.max(20, Math.min(220, sx));
+            sy = Math.max(20, Math.min(210, sy));
+
+            sb.append(';').append(sx).append(',').append(sy);
+            added++;
+        }
+        return sb.toString();
+    }
+
+    static class LatLon {
+        double lat;
+        double lon;
+        LatLon(double a, double b) { lat = a; lon = b; }
+    }
+}
