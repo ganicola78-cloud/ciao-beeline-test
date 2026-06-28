@@ -302,6 +302,20 @@ public class NavView extends View {
         textPaint.setColor(Color.WHITE);
     }
 
+
+    private void drawTriangle(Canvas c, float cx, float cy, float halfWidth) {
+        float height = 28f;
+
+        Path tri = new Path();
+        tri.moveTo(cx, cy - height / 2f);
+        tri.lineTo(cx - halfWidth, cy + height / 2f);
+        tri.lineTo(cx + halfWidth, cy + height / 2f);
+        tri.close();
+
+        c.drawPath(tri, fillPaint);
+        c.drawPath(tri, strokePaint);
+    }
+
     private void drawBottom(Canvas c) {
         float distY = 182f;
         float speedY = 207f;
