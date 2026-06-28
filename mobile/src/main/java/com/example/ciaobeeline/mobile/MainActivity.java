@@ -46,6 +46,7 @@ public class MainActivity extends Activity {
     private static final long RECALC_COOLDOWN_MS = 3000;
     private static final long PERIODIC_RECALC_MS = 60000;
     private static final float GPS_BEARING_MIN_SPEED_KMH = 14.0f;
+    private static final long SPEED_LIMIT_REFRESH_MS = 30000;
 
     private EditText apiKeyEdit;
     private EditText destinationEdit;
@@ -63,6 +64,12 @@ public class MainActivity extends Activity {
     private long lastRouteMs = 0;
     private long lastSendMs = 0;
     private double offRouteMeters = 9999;
+        lastSpeedLimit = -1;
+        lastSpeedLimitMs = 0;
+        speedLimitRequestInProgress = false;
+    private int lastSpeedLimit = -1;
+    private long lastSpeedLimitMs = 0;
+    private boolean speedLimitRequestInProgress = false;
     private LatLon lastDestination = null;
     private String lastDestinationText = "";
 
@@ -147,6 +154,9 @@ public class MainActivity extends Activity {
         lastRouteMs = 0;
         lastSendMs = 0;
         offRouteMeters = 9999;
+        lastSpeedLimit = -1;
+        lastSpeedLimitMs = 0;
+        speedLimitRequestInProgress = false;
 
         try {
             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
@@ -186,7 +196,7 @@ public class MainActivity extends Activity {
         routeRequestInProgress = false;
         try { locationManager.removeUpdates(listener); } catch (Exception ignored) {}
         status.setText("Navigazione fermata.");
-        sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"line\":\"120,200;120,80\"}");
+        sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,200;120,80\"}");
     }
 
     private final LocationListener listener = loc -> {
@@ -246,7 +256,7 @@ public class MainActivity extends Activity {
 
         if (forceStatus) {
             status.setText("Ricalcolo rotta...");
-            sendToWear("{\"mode\":\"REROUTE\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"line\":\"120,200;120,160;120,120;120,80\"}");
+            sendToWear("{\"mode\":\"REROUTE\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,200;120,160;120,120;120,80\"}");
         }
 
         new Thread(() -> {
@@ -389,6 +399,7 @@ public class MainActivity extends Activity {
                 currentLocation.getLatitude(), currentLocation.getLongitude());
 
         float speedKmh = Math.max(0, currentLocation.getSpeed() * 3.6f);
+        requestSpeedLimitIfNeeded(currentLocation);
         String line = buildScreenLine(copy, nearest, currentLocation);
 
         Maneuver next = nextManeuver(manCopy, nearest);
@@ -410,6 +421,7 @@ public class MainActivity extends Activity {
             o.put("speed", Math.round(speedKmh));
             o.put("dist", Math.max(0, Math.min(999, dist)));
             o.put("turn", turn);
+            o.put("limit", lastSpeedLimit);
             o.put("line", line);
 
             sendToWear(o.toString());
@@ -450,8 +462,132 @@ public class MainActivity extends Activity {
         return (int) Math.round(acc);
     }
 
+    private void requestSpeedLimitIfNeeded(Location loc) {
+        if (loc == null) return;
+
+        long now = System.currentTimeMillis();
+
+        if (speedLimitRequestInProgress) return;
+        if (now - lastSpeedLimitMs < SPEED_LIMIT_REFRESH_MS) return;
+
+        speedLimitRequestInProgress = true;
+        lastSpeedLimitMs = now;
+
+        final double lat = loc.getLatitude();
+        final double lon = loc.getLongitude();
+
+        new Thread(() -> {
+            int found = -1;
+
+            try {
+                found = requestSpeedLimitFromOsm(lat, lon);
+            } catch (Exception ignored) {
+            }
+
+            final int result = found;
+
+            handler.post(() -> {
+                speedLimitRequestInProgress = false;
+
+                if (result > 0) {
+                    lastSpeedLimit = result;
+                }
+            });
+        }).start();
+    }
+
+    private int requestSpeedLimitFromOsm(double lat, double lon) throws Exception {
+        URL url = new URL("https://overpass-api.de/api/interpreter");
+
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8");
+
+        String query =
+                "[out:json][timeout:5];" +
+                "way(around:60," + lat + "," + lon + ")[\"highway\"][\"maxspeed\"];" +
+                "out tags 8;";
+
+        String body = "data=" + URLEncoder.encode(query, "UTF-8");
+
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+
+        if (c.getResponseCode() >= 400) {
+            return -1;
+        }
+
+        JSONObject json = new JSONObject(txt);
+        JSONArray elements = json.optJSONArray("elements");
+
+        if (elements == null || elements.length() == 0) {
+            return -1;
+        }
+
+        for (int i = 0; i < elements.length(); i++) {
+            JSONObject tags = elements.getJSONObject(i).optJSONObject("tags");
+
+            if (tags == null) continue;
+
+            String raw = tags.optString("maxspeed", "");
+            int parsed = parseSpeedLimit(raw);
+
+            if (parsed > 0) {
+                return parsed;
+            }
+        }
+
+        return -1;
+    }
+
+    private int parseSpeedLimit(String raw) {
+        if (raw == null) return -1;
+
+        String s = raw.trim().toLowerCase();
+
+        if (s.length() == 0) return -1;
+        if (s.contains("signals")) return -1;
+        if (s.contains("none")) return -1;
+        if (s.contains("walk")) return -1;
+
+        boolean mph = s.contains("mph");
+
+        StringBuilder digits = new StringBuilder();
+
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+
+            if (ch >= '0' && ch <= '9') {
+                digits.append(ch);
+            } else if (digits.length() > 0) {
+                break;
+            }
+        }
+
+        if (digits.length() == 0) return -1;
+
+        try {
+            int value = Integer.parseInt(digits.toString());
+
+            if (mph) {
+                value = (int) Math.round(value * 1.60934);
+            }
+
+            if (value < 5 || value > 140) return -1;
+
+            return value;
+        } catch (Exception ignored) {
+            return -1;
+        }
+    }
+
     private void sendDemo() {
-        String demoJson = "{\"mode\":\"NAV\",\"speed\":36,\"dist\":300,\"turn\":\"RIGHT\",\"line\":\"120,200;120,165;145,140;145,95;105,60\"}";
+        String demoJson = "{\"mode\":\"NAV\",\"speed\":36,\"dist\":300,\"turn\":\"RIGHT\",\"limit\":50,\"line\":\"120,200;120,165;145,140;145,95;105,60\"}";
         sendToWear(demoJson);
         status.setText("Demo inviata al Carlyle.");
     }
