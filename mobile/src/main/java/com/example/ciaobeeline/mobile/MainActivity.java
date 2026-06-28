@@ -40,7 +40,7 @@ public class MainActivity extends Activity {
     private static final String PREF_API_KEY = "ors_api_key";
     private static final String PREF_DESTINATION = "destination_text";
 
-    // V0.6: svolte vere da OpenRouteService steps
+    // V0.8: svolte vere ORS + OSM speed limit + linea agganciata alla freccia
     private static final double OFF_ROUTE_RECALC_METERS = 22.0;
     private static final double OFF_ROUTE_WARN_METERS = 35.0;
     private static final long RECALC_COOLDOWN_MS = 3000;
@@ -67,6 +67,7 @@ public class MainActivity extends Activity {
     private int lastSpeedLimit = -1;
     private long lastSpeedLimitMs = 0;
     private boolean speedLimitRequestInProgress = false;
+    private long navSeq = 0;
     private LatLon lastDestination = null;
     private String lastDestinationText = "";
 
@@ -193,7 +194,7 @@ public class MainActivity extends Activity {
         routeRequestInProgress = false;
         try { locationManager.removeUpdates(listener); } catch (Exception ignored) {}
         status.setText("Navigazione fermata.");
-        sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,200;120,80\"}");
+        sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,140;120,70\"}");
     }
 
     private final LocationListener listener = loc -> {
@@ -253,7 +254,7 @@ public class MainActivity extends Activity {
 
         if (forceStatus) {
             status.setText("Ricalcolo rotta...");
-            sendToWear("{\"mode\":\"REROUTE\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,200;120,160;120,120;120,80\"}");
+            sendToWear("{\"mode\":\"REROUTE\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,140;120,105;120,70;120,40\"}");
         }
 
         new Thread(() -> {
@@ -414,7 +415,9 @@ public class MainActivity extends Activity {
 
         try {
             JSONObject o = new JSONObject();
-            o.put("mode", offRouteMeters > OFF_ROUTE_WARN_METERS ? "OFF_ROUTE" : (recalculated ? "REROUTE" : "NAV"));
+            o.put("mode", offRouteMeters > OFF_ROUTE_WARN_METERS ? "OFF_ROUTE" : "NAV");
+            o.put("seq", ++navSeq);
+            o.put("recalculated", recalculated);
             o.put("speed", Math.round(speedKmh));
             o.put("dist", Math.max(0, Math.min(999, dist)));
             o.put("turn", turn);
@@ -584,7 +587,7 @@ public class MainActivity extends Activity {
     }
 
     private void sendDemo() {
-        String demoJson = "{\"mode\":\"NAV\",\"speed\":36,\"dist\":300,\"turn\":\"RIGHT\",\"limit\":50,\"line\":\"120,200;120,165;145,140;145,95;105,60\"}";
+        String demoJson = "{\"mode\":\"NAV\",\"speed\":36,\"dist\":300,\"turn\":\"RIGHT\",\"limit\":50,\"line\":\"120,140;120,110;145,92;145,60;105,40\"}";
         sendToWear(demoJson);
         status.setText("Demo inviata al Carlyle.");
     }
@@ -683,39 +686,57 @@ public class MainActivity extends Activity {
     }
 
     private static String buildScreenLine(ArrayList<LatLon> pts, int idx, Location loc) {
-        if (idx >= pts.size()) return "120,200;120,80";
+        if (idx >= pts.size()) return "120,140;120,70";
 
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
         double head;
-        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) head = loc.getBearing();
-        else head = routeHeading(pts, idx);
+
+        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
+            head = loc.getBearing();
+        } else {
+            head = routeHeading(pts, idx);
+        }
 
         StringBuilder sb = new StringBuilder();
-        double lat0 = loc.getLatitude();
-        double lon0 = loc.getLongitude();
+
+        // V0.8: la linea parte sempre esattamente dalla freccia sul Carlyle.
+        // Usiamo il punto più vicino della rotta come "origine agganciata",
+        // così il GPS leggermente laterale non fa sembrare la freccia fuori strada.
+        LatLon origin = pts.get(Math.max(0, Math.min(idx, pts.size() - 1)));
+        double lat0 = origin.lat;
+        double lon0 = origin.lon;
+
         int added = 0;
 
-        sb.append("120,200");
+        sb.append("120,140");
         added++;
 
-        for (int i = Math.max(idx + 1, 0); i < pts.size() && added < 20; i += 2) {
+        for (int i = Math.max(idx + 1, 0); i < pts.size() && added < 24; i++) {
             LatLon p = pts.get(i);
             double dist = distanceMeters(lat0, lon0, p.lat, p.lon);
-            if (dist > 300 && added > 4) break;
+
+            if (dist < 5) continue;
+            if (dist > 280 && added > 5) break;
 
             double br = bearing(lat0, lon0, p.lat, p.lon);
             double rel = Math.toRadians(angleDiff(head, br));
             double x = Math.sin(rel) * dist;
             double y = Math.cos(rel) * dist;
 
-            int sx = (int) Math.round(120 + x * 0.55);
-            int sy = (int) Math.round(200 - y * 0.55);
-            sx = Math.max(20, Math.min(220, sx));
-            sy = Math.max(20, Math.min(210, sy));
+            int sx = (int) Math.round(120 + x * 0.58);
+            int sy = (int) Math.round(140 - y * 0.58);
+
+            sx = Math.max(18, Math.min(222, sx));
+            sy = Math.max(18, Math.min(148, sy));
 
             sb.append(';').append(sx).append(',').append(sy);
             added++;
         }
+
+        if (added < 2) {
+            sb.append(";120,70");
+        }
+
         return sb.toString();
     }
 
