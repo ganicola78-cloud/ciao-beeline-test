@@ -28,6 +28,7 @@ public class NavView extends View {
     private String turn = "RIGHT";
     private int dist = 300;
     private int speed = 0;
+    private int limit = -1;
 
     // Linea demo/default
     private String line = "120,200;120,165;145,140;145,95;105,60";
@@ -75,6 +76,7 @@ public class NavView extends View {
             turn = o.optString("turn", turn);
             dist = o.optInt("dist", dist);
             speed = o.optInt("speed", speed);
+            limit = o.optInt("limit", limit);
             line = o.optString("line", line);
             postInvalidate();
         } catch (Exception ignored) {
@@ -155,7 +157,7 @@ public class NavView extends View {
         drawRoutePath(c, screenPts);
         drawTriangle(c, 120, 140, 16);
         drawBottom(c);
-        drawProgressArc(c);
+        drawSpeedLimit(c);
 
         if ("REROUTE".equals(mode)) {
             textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
@@ -293,6 +295,31 @@ public class NavView extends View {
         c.drawPath(tri, strokePaint);
     }
 
+    private void drawSpeedLimit(Canvas c) {
+        if (limit <= 0) return;
+
+        float cx = 184f;
+        float cy = 174f;
+        float r = 17f;
+
+        Paint circlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        circlePaint.setStyle(Paint.Style.FILL);
+        circlePaint.setColor(Color.WHITE);
+        c.drawCircle(cx, cy, r, circlePaint);
+
+        circlePaint.setStyle(Paint.Style.STROKE);
+        circlePaint.setStrokeWidth(4f);
+        circlePaint.setColor(Color.rgb(220, 45, 45));
+        c.drawCircle(cx, cy, r - 2f, circlePaint);
+
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextSize(limit >= 100 ? 12f : 15f);
+        textPaint.setColor(Color.BLACK);
+        c.drawText(String.valueOf(limit), cx, cy + 5f, textPaint);
+        textPaint.setColor(Color.WHITE);
+    }
+
     private void drawBottom(Canvas c) {
         float distY = 182f;
         float speedY = 207f;
@@ -304,11 +331,6 @@ public class NavView extends View {
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         textPaint.setTextSize(22);
         c.drawText(speed + " km/h", 120, speedY, textPaint);
-    }
-
-    private void drawProgressArc(Canvas c) {
-        RectF arc = new RectF(55, 162, 185, 230);
-        c.drawArc(arc, 160, 55, false, progressPaint);
     }
 
     private String turnSymbol(String t) {
