@@ -40,7 +40,7 @@ public class MainActivity extends Activity {
     private static final String PREF_API_KEY = "ors_api_key";
     private static final String PREF_DESTINATION = "destination_text";
 
-    // V0.3 road-test tuning
+    // V0.6: svolte vere da OpenRouteService steps
     private static final double OFF_ROUTE_RECALC_METERS = 22.0;
     private static final double OFF_ROUTE_WARN_METERS = 35.0;
     private static final long RECALC_COOLDOWN_MS = 3000;
@@ -56,6 +56,7 @@ public class MainActivity extends Activity {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ArrayList<LatLon> route = new ArrayList<>();
+    private final ArrayList<Maneuver> maneuvers = new ArrayList<>();
 
     private boolean running = false;
     private boolean routeRequestInProgress = false;
@@ -69,10 +70,7 @@ public class MainActivity extends Activity {
     public void onCreate(Bundle b) {
         super.onCreate(b);
 
-        // Evita che il telefono vada in standby mentre l'app è aperta.
-        // Per una versione definitiva servirà un Foreground Service.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-
         locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
 
         LinearLayout root = new LinearLayout(this);
@@ -140,7 +138,10 @@ public class MainActivity extends Activity {
         savePrefs();
         running = true;
         routeRequestInProgress = false;
-        route.clear();
+
+        synchronized (route) { route.clear(); }
+        synchronized (maneuvers) { maneuvers.clear(); }
+
         lastDestination = null;
         lastDestinationText = "";
         lastRouteMs = 0;
@@ -159,8 +160,7 @@ public class MainActivity extends Activity {
             try {
                 lastGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
                 lastNetwork = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-            } catch (SecurityException ignored) {
-            }
+            } catch (SecurityException ignored) {}
 
             currentLocation = bestLocation(lastGps, lastNetwork);
 
@@ -184,17 +184,13 @@ public class MainActivity extends Activity {
     private void stopRouting() {
         running = false;
         routeRequestInProgress = false;
-        try {
-            locationManager.removeUpdates(listener);
-        } catch (Exception ignored) {
-        }
+        try { locationManager.removeUpdates(listener); } catch (Exception ignored) {}
         status.setText("Navigazione fermata.");
         sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"line\":\"120,200;120,80\"}");
     }
 
     private final LocationListener listener = loc -> {
         currentLocation = loc;
-
         if (!running) return;
 
         long now = System.currentTimeMillis();
@@ -220,9 +216,7 @@ public class MainActivity extends Activity {
     private void updateOffRouteDistance() {
         if (currentLocation == null) return;
         ArrayList<LatLon> copy;
-        synchronized (route) {
-            copy = new ArrayList<>(route);
-        }
+        synchronized (route) { copy = new ArrayList<>(route); }
         if (copy.isEmpty()) return;
         int nearest = nearestIndex(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
         offRouteMeters = distanceMeters(copy.get(nearest).lat, copy.get(nearest).lon,
@@ -235,7 +229,6 @@ public class MainActivity extends Activity {
 
         final String key = apiKeyEdit.getText().toString().trim();
         final String destinationText = destinationEdit.getText().toString().trim();
-
         savePrefs();
 
         if (key.length() < 8) {
@@ -259,7 +252,6 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 LatLon dest;
-
                 if (lastDestination != null && destinationText.equals(lastDestinationText)) {
                     dest = lastDestination;
                 } else {
@@ -268,19 +260,22 @@ public class MainActivity extends Activity {
                     lastDestinationText = destinationText;
                 }
 
-                ArrayList<LatLon> newRoute = requestDirections(key, dest);
+                RouteResult result = requestDirections(key, dest);
 
                 synchronized (route) {
                     route.clear();
-                    route.addAll(newRoute);
+                    route.addAll(result.points);
+                }
+                synchronized (maneuvers) {
+                    maneuvers.clear();
+                    maneuvers.addAll(result.maneuvers);
                 }
 
                 handler.post(() -> {
                     routeRequestInProgress = false;
-                    status.setText("Rotta aggiornata: " + destinationText + " - punti: " + newRoute.size());
+                    status.setText("Rotta aggiornata: " + destinationText + " - punti: " + result.points.size() + " - svolte: " + result.maneuvers.size());
                     sendNavUpdate(true);
                 });
-
             } catch (Exception e) {
                 handler.post(() -> {
                     routeRequestInProgress = false;
@@ -301,22 +296,17 @@ public class MainActivity extends Activity {
         InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
         String txt = readAll(is);
 
-        if (c.getResponseCode() >= 400) {
-            throw new RuntimeException("Geocoding: " + txt);
-        }
+        if (c.getResponseCode() >= 400) throw new RuntimeException("Geocoding: " + txt);
 
         JSONObject json = new JSONObject(txt);
         JSONArray features = json.getJSONArray("features");
-
-        if (features.length() == 0) {
-            throw new RuntimeException("Destinazione non trovata. Prova con indirizzo più preciso, es. Via Roma, Cagliari, Italia.");
-        }
+        if (features.length() == 0) throw new RuntimeException("Destinazione non trovata. Prova con indirizzo più preciso.");
 
         JSONArray coords = features.getJSONObject(0).getJSONObject("geometry").getJSONArray("coordinates");
         return new LatLon(coords.getDouble(1), coords.getDouble(0));
     }
 
-    private ArrayList<LatLon> requestDirections(String key, LatLon dest) throws Exception {
+    private RouteResult requestDirections(String key, LatLon dest) throws Exception {
         URL url = new URL("https://api.openrouteservice.org/v2/directions/driving-car/geojson");
 
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
@@ -338,22 +328,43 @@ public class MainActivity extends Activity {
         InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
         String txt = readAll(is);
 
-        if (c.getResponseCode() >= 400) {
-            throw new RuntimeException(txt);
-        }
+        if (c.getResponseCode() >= 400) throw new RuntimeException(txt);
 
         JSONObject json = new JSONObject(txt);
-        JSONArray coords = json.getJSONArray("features")
-                .getJSONObject(0)
-                .getJSONObject("geometry")
-                .getJSONArray("coordinates");
+        JSONObject feature = json.getJSONArray("features").getJSONObject(0);
+        JSONArray coords = feature.getJSONObject("geometry").getJSONArray("coordinates");
 
         ArrayList<LatLon> newRoute = new ArrayList<>();
         for (int i = 0; i < coords.length(); i++) {
             JSONArray p = coords.getJSONArray(i);
             newRoute.add(new LatLon(p.getDouble(1), p.getDouble(0)));
         }
-        return newRoute;
+
+        ArrayList<Maneuver> newManeuvers = new ArrayList<>();
+        JSONArray segments = feature.getJSONObject("properties").optJSONArray("segments");
+
+        if (segments != null) {
+            for (int s = 0; s < segments.length(); s++) {
+                JSONArray steps = segments.getJSONObject(s).optJSONArray("steps");
+                if (steps == null) continue;
+
+                for (int i = 0; i < steps.length(); i++) {
+                    JSONObject step = steps.getJSONObject(i);
+                    JSONArray wp = step.optJSONArray("way_points");
+                    if (wp == null || wp.length() < 2) continue;
+
+                    int startIndex = wp.optInt(0, 0);
+                    int endIndex = wp.optInt(1, startIndex);
+                    int type = step.optInt("type", -1);
+                    double distance = step.optDouble("distance", 0);
+                    String instruction = step.optString("instruction", "");
+
+                    newManeuvers.add(new Maneuver(startIndex, endIndex, type, distance, instruction));
+                }
+            }
+        }
+
+        return new RouteResult(newRoute, newManeuvers);
     }
 
     private void sendNavUpdate(boolean recalculated) {
@@ -364,9 +375,9 @@ public class MainActivity extends Activity {
         lastSendMs = now;
 
         ArrayList<LatLon> copy;
-        synchronized (route) {
-            copy = new ArrayList<>(route);
-        }
+        synchronized (route) { copy = new ArrayList<>(route); }
+        ArrayList<Maneuver> manCopy;
+        synchronized (maneuvers) { manCopy = new ArrayList<>(maneuvers); }
 
         if (copy.isEmpty()) {
             sendDemo();
@@ -374,28 +385,69 @@ public class MainActivity extends Activity {
         }
 
         int nearest = nearestIndex(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
-
         offRouteMeters = distanceMeters(copy.get(nearest).lat, copy.get(nearest).lon,
                 currentLocation.getLatitude(), currentLocation.getLongitude());
 
         float speedKmh = Math.max(0, currentLocation.getSpeed() * 3.6f);
         String line = buildScreenLine(copy, nearest, currentLocation);
-        String turn = inferTurn(copy, nearest);
-        int dist = distanceToNextBend(copy, nearest);
+
+        Maneuver next = nextManeuver(manCopy, nearest);
+        String turn;
+        int dist;
+
+        if (next != null) {
+            turn = turnFromOpenRouteType(next.type);
+            dist = distanceAlongRoute(copy, nearest, next.endIndex);
+            if (dist < 0) dist = (int) Math.round(next.distance);
+        } else {
+            turn = inferTurn(copy, nearest);
+            dist = distanceToNextBend(copy, nearest);
+        }
 
         try {
             JSONObject o = new JSONObject();
             o.put("mode", offRouteMeters > OFF_ROUTE_WARN_METERS ? "OFF_ROUTE" : (recalculated ? "REROUTE" : "NAV"));
             o.put("speed", Math.round(speedKmh));
-            o.put("dist", dist);
+            o.put("dist", Math.max(0, Math.min(999, dist)));
             o.put("turn", turn);
             o.put("line", line);
 
             sendToWear(o.toString());
+            status.setText("Nav " + Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(999, dist))) + " m - off " + Math.round(offRouteMeters) + " m");
+        } catch (JSONException ignored) {}
+    }
 
-            status.setText("Nav " + Math.round(speedKmh) + " km/h - off " + Math.round(offRouteMeters) + " m");
-        } catch (JSONException ignored) {
+    private Maneuver nextManeuver(ArrayList<Maneuver> list, int nearestRouteIndex) {
+        if (list.isEmpty()) return null;
+        for (Maneuver m : list) {
+            // type 11 è spesso la partenza: non mostrarlo come prossima svolta.
+            if (m.endIndex > nearestRouteIndex + 1 && m.type != 11) return m;
         }
+        return null;
+    }
+
+    private String turnFromOpenRouteType(int type) {
+        // ORS: 0 left, 1 right, 2 sharp left, 3 sharp right,
+        // 4 slight left, 5 slight right, 6 straight,
+        // 7 enter roundabout, 8 exit roundabout, 10 destination, 11 depart.
+        if (type == 0 || type == 2 || type == 4) return "LEFT";
+        if (type == 1 || type == 3 || type == 5) return "RIGHT";
+        if (type == 7 || type == 8) return "ROUND";
+        return "STRAIGHT";
+    }
+
+    private int distanceAlongRoute(ArrayList<LatLon> pts, int from, int to) {
+        if (pts.isEmpty()) return -1;
+        int start = Math.max(0, Math.min(from, pts.size() - 1));
+        int end = Math.max(0, Math.min(to, pts.size() - 1));
+        if (end <= start) return 0;
+
+        double acc = 0;
+        for (int i = start; i < end; i++) {
+            acc += distanceMeters(pts.get(i).lat, pts.get(i).lon, pts.get(i + 1).lat, pts.get(i + 1).lon);
+            if (acc > 999) return 999;
+        }
+        return (int) Math.round(acc);
     }
 
     private void sendDemo() {
@@ -407,12 +459,9 @@ public class MainActivity extends Activity {
     private void sendToWear(String msg) {
         com.google.android.gms.wearable.PutDataMapRequest mapRequest =
                 com.google.android.gms.wearable.PutDataMapRequest.create(PATH);
-
         mapRequest.getDataMap().putString("json", msg);
         mapRequest.getDataMap().putLong("ts", System.currentTimeMillis());
-
         com.google.android.gms.wearable.PutDataRequest request = mapRequest.asPutDataRequest().setUrgent();
-
         Wearable.getDataClient(this).putDataItem(request);
 
         Wearable.getNodeClient(this).getConnectedNodes().addOnSuccessListener(nodes -> {
@@ -505,20 +554,14 @@ public class MainActivity extends Activity {
 
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
         double head;
-
-        // Il bearing GPS a bassa velocità è instabile: orientiamo sulla rotta.
-        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
-            head = loc.getBearing();
-        } else {
-            head = routeHeading(pts, idx);
-        }
+        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) head = loc.getBearing();
+        else head = routeHeading(pts, idx);
 
         StringBuilder sb = new StringBuilder();
         double lat0 = loc.getLatitude();
         double lon0 = loc.getLongitude();
         int added = 0;
 
-        // Primo punto: sempre in basso/centro davanti alla freccia.
         sb.append("120,200");
         added++;
 
@@ -547,5 +590,29 @@ public class MainActivity extends Activity {
         double lat;
         double lon;
         LatLon(double a, double b) { lat = a; lon = b; }
+    }
+
+    static class Maneuver {
+        int startIndex;
+        int endIndex;
+        int type;
+        double distance;
+        String instruction;
+        Maneuver(int startIndex, int endIndex, int type, double distance, String instruction) {
+            this.startIndex = startIndex;
+            this.endIndex = endIndex;
+            this.type = type;
+            this.distance = distance;
+            this.instruction = instruction;
+        }
+    }
+
+    static class RouteResult {
+        ArrayList<LatLon> points;
+        ArrayList<Maneuver> maneuvers;
+        RouteResult(ArrayList<LatLon> points, ArrayList<Maneuver> maneuvers) {
+            this.points = points;
+            this.maneuvers = maneuvers;
+        }
     }
 }
