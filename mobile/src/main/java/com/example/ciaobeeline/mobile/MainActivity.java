@@ -64,9 +64,6 @@ public class MainActivity extends Activity {
     private long lastRouteMs = 0;
     private long lastSendMs = 0;
     private double offRouteMeters = 9999;
-        lastSpeedLimit = -1;
-        lastSpeedLimitMs = 0;
-        speedLimitRequestInProgress = false;
     private int lastSpeedLimit = -1;
     private long lastSpeedLimitMs = 0;
     private boolean speedLimitRequestInProgress = false;
