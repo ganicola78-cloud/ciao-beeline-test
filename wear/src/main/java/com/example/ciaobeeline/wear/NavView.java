@@ -314,6 +314,7 @@ public class NavView extends View {
     private String turnSymbol(String t) {
         if ("LEFT".equals(t)) return "↰";
         if ("RIGHT".equals(t)) return "↱";
+        if ("ROUND".equals(t)) return "↻";
         return "↑";
     }
 
