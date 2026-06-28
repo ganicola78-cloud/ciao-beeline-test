@@ -149,12 +149,13 @@ public class NavView extends View {
     }
 
     private void drawNav(Canvas c) {
-        RectF routeBox = new RectF(34, 24, 206, 118);
+        RectF routeBox = new RectF(18, 18, 222, 148);
 
         ArrayList<PointF> screenPts = transformedLine(routeBox);
 
         drawSideRoads(c, screenPts);
         drawRoutePath(c, screenPts);
+        drawRoundaboutHint(c);
         drawTriangle(c, 120, 140, 16);
         drawBottom(c);
         drawSpeedLimit(c);
@@ -248,51 +249,32 @@ public class NavView extends View {
         ArrayList<PointF> pts = parseLine(line);
         ArrayList<PointF> out = new ArrayList<>();
 
-        if (pts.size() < 2) return out;
-
-        float minX = pts.get(0).x;
-        float maxX = pts.get(0).x;
-        float minY = pts.get(0).y;
-        float maxY = pts.get(0).y;
-
+        // V0.8: niente ridimensionamento automatico.
+        // Le coordinate arrivano già dal telefono con partenza 120,140,
+        // quindi la freccia resta agganciata alla riga bianca.
         for (PointF p : pts) {
-            if (p.x < minX) minX = p.x;
-            if (p.x > maxX) maxX = p.x;
-            if (p.y < minY) minY = p.y;
-            if (p.y > maxY) maxY = p.y;
-        }
-
-        float srcW = Math.max(1f, maxX - minX);
-        float srcH = Math.max(1f, maxY - minY);
-
-        float scale = Math.min(box.width() / srcW, box.height() / srcH);
-
-        float dstW = srcW * scale;
-        float dstH = srcH * scale;
-
-        float offsetX = box.left + (box.width() - dstW) / 2f;
-        float offsetY = box.top + (box.height() - dstH) / 2f;
-
-        for (PointF src : pts) {
-            float x = offsetX + (src.x - minX) * scale;
-            float y = offsetY + (src.y - minY) * scale;
+            float x = Math.max(box.left, Math.min(box.right, p.x));
+            float y = Math.max(box.top, Math.min(box.bottom, p.y));
             out.add(new PointF(x, y));
         }
 
         return out;
     }
 
-    private void drawTriangle(Canvas c, float cx, float cy, float halfWidth) {
-        float height = 28f;
+    private void drawRoundaboutHint(Canvas c) {
+        if (!"ROUND".equals(turn)) return;
 
-        Path tri = new Path();
-        tri.moveTo(cx, cy - height / 2f);
-        tri.lineTo(cx - halfWidth, cy + height / 2f);
-        tri.lineTo(cx + halfWidth, cy + height / 2f);
-        tri.close();
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(7f);
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setColor(Color.WHITE);
 
-        c.drawPath(tri, fillPaint);
-        c.drawPath(tri, strokePaint);
+        RectF r = new RectF(93, 50, 147, 104);
+        c.drawArc(r, 35, 300, false, p);
+
+        // Piccola uscita verso l'alto/destra per rendere visibile la rotatoria.
+        c.drawLine(138, 60, 166, 42, p);
     }
 
     private void drawSpeedLimit(Canvas c) {
