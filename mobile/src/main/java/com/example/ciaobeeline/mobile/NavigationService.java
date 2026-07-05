@@ -47,7 +47,7 @@ public class NavigationService extends Service {
     private static final String CHANNEL_ID = "ciao_beeline_navigation";
     private static final int NOTIFICATION_ID = 1001;
 
-    // V0.14: strada agganciata alla posizione reale con match su segmento + ricalcolo rapido
+    // V0.16: strada agganciata al segmento + distanza senza blocco a 999 m
     private static final double OFF_ROUTE_RECALC_METERS = 14.0;
     private static final double OFF_ROUTE_WARN_METERS = 24.0;
     private static final long RECALC_COOLDOWN_MS = 1200;
@@ -837,14 +837,23 @@ public class NavigationService extends Service {
 
     private static int distanceToNextBend(ArrayList<LatLon> pts, int idx) {
         double acc = 0;
+
         for (int i = idx; i < pts.size() - 8; i++) {
             double b1 = bearing(pts.get(i).lat, pts.get(i).lon, pts.get(i + 3).lat, pts.get(i + 3).lon);
             double b2 = bearing(pts.get(i + 3).lat, pts.get(i + 3).lon, pts.get(i + 8).lat, pts.get(i + 8).lon);
-            if (Math.abs(angleDiff(b1, b2)) > 35) return (int) Math.max(20, acc);
+
+            if (Math.abs(angleDiff(b1, b2)) > 35) {
+                return (int) Math.max(20, Math.min(99999, acc));
+            }
+
             acc += distanceMeters(pts.get(i).lat, pts.get(i).lon, pts.get(i + 1).lat, pts.get(i + 1).lon);
-            if (acc > 999) break;
+
+            if (acc > 99999) {
+                return 99999;
+            }
         }
-        return (int) Math.min(999, acc);
+
+        return (int) Math.min(99999, acc);
     }
 
     private static String buildScreenLine(ArrayList<LatLon> pts, RouteMatch match, Location loc) {
