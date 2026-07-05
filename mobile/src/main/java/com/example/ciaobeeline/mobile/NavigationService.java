@@ -47,7 +47,7 @@ public class NavigationService extends Service {
     private static final String CHANNEL_ID = "ciao_beeline_navigation";
     private static final int NOTIFICATION_ID = 1001;
 
-    // V0.8: svolte vere ORS + OSM speed limit + linea agganciata alla freccia
+    // V0.11: foreground service + svolte ORS + OSM speed limit + distanza anche oltre 999 m
     private static final double OFF_ROUTE_RECALC_METERS = 22.0;
     private static final double OFF_ROUTE_WARN_METERS = 35.0;
     private static final long RECALC_COOLDOWN_MS = 3000;
@@ -402,13 +402,13 @@ public class NavigationService extends Service {
             o.put("seq", ++navSeq);
             o.put("recalculated", recalculated);
             o.put("speed", Math.round(speedKmh));
-            o.put("dist", Math.max(0, Math.min(999, dist)));
+            o.put("dist", Math.max(0, Math.min(99999, dist)));
             o.put("turn", turn);
             o.put("limit", lastSpeedLimit);
             o.put("line", line);
 
             sendToWear(o.toString());
-            updateNotification("Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
+            updateNotification("Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
         } catch (JSONException ignored) {}
     }
 
