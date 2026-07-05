@@ -156,7 +156,7 @@ public class NavView extends View {
         drawSideRoads(c, screenPts);
         drawRoutePath(c, screenPts);
         drawRoundaboutHint(c);
-        drawTriangleAlignedToRoute(c, screenPts, 120, 140, 16);
+        drawTriangle(c, 120, 140, 16);
         drawBottom(c);
         drawSpeedLimit(c);
 
@@ -249,12 +249,28 @@ public class NavView extends View {
         ArrayList<PointF> pts = parseLine(line);
         ArrayList<PointF> out = new ArrayList<>();
 
-        // V0.8: niente ridimensionamento automatico.
-        // Le coordinate arrivano già dal telefono con partenza 120,140,
-        // quindi la freccia resta agganciata alla riga bianca.
+        // V0.12: la mappa viene ruotata intorno alla freccia.
+        // Il primo tratto della strada davanti viene sempre portato in verticale,
+        // così la rotta sembra "frontale" come su Beeline.
+        float cx = 120f;
+        float cy = 140f;
+        float angle = routeStartAngleDegrees(pts, cx, cy);
+        float rotate = -angle;
+
+        double rad = Math.toRadians(rotate);
+        float cos = (float) Math.cos(rad);
+        float sin = (float) Math.sin(rad);
+
         for (PointF p : pts) {
-            float x = Math.max(box.left, Math.min(box.right, p.x));
-            float y = Math.max(box.top, Math.min(box.bottom, p.y));
+            float dx = p.x - cx;
+            float dy = p.y - cy;
+
+            float rx = cx + dx * cos - dy * sin;
+            float ry = cy + dx * sin + dy * cos;
+
+            float x = Math.max(box.left, Math.min(box.right, rx));
+            float y = Math.max(box.top, Math.min(box.bottom, ry));
+
             out.add(new PointF(x, y));
         }
 
