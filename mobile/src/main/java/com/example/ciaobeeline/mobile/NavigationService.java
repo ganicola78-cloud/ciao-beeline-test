@@ -47,12 +47,12 @@ public class NavigationService extends Service {
     private static final String CHANNEL_ID = "ciao_beeline_navigation";
     private static final int NOTIFICATION_ID = 1001;
 
-    // V0.11: foreground service + svolte ORS + OSM speed limit + distanza anche oltre 999 m
-    private static final double OFF_ROUTE_RECALC_METERS = 22.0;
-    private static final double OFF_ROUTE_WARN_METERS = 35.0;
-    private static final long RECALC_COOLDOWN_MS = 3000;
-    private static final long PERIODIC_RECALC_MS = 60000;
-    private static final float GPS_BEARING_MIN_SPEED_KMH = 14.0f;
+    // V0.14: strada agganciata alla posizione reale con match su segmento + ricalcolo rapido
+    private static final double OFF_ROUTE_RECALC_METERS = 14.0;
+    private static final double OFF_ROUTE_WARN_METERS = 24.0;
+    private static final long RECALC_COOLDOWN_MS = 1200;
+    private static final long PERIODIC_RECALC_MS = 30000;
+    private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
 
     private LocationManager locationManager;
@@ -134,8 +134,8 @@ public class NavigationService extends Service {
 
         try {
             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 700, 1, listener);
-                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1000, 1, listener);
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 400, 0, listener);
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 700, 0, listener);
             }
 
             Location lastGps = null;
@@ -207,12 +207,16 @@ public class NavigationService extends Service {
 
     private void updateOffRouteDistance() {
         if (currentLocation == null) return;
+
         ArrayList<LatLon> copy;
-        synchronized (route) { copy = new ArrayList<>(route); }
+        synchronized (route) {
+            copy = new ArrayList<>(route);
+        }
+
         if (copy.isEmpty()) return;
-        int nearest = nearestIndex(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
-        offRouteMeters = distanceMeters(copy.get(nearest).lat, copy.get(nearest).lon,
-                currentLocation.getLatitude(), currentLocation.getLongitude());
+
+        RouteMatch match = matchRoute(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
+        offRouteMeters = match.offMeters;
     }
 
     private void requestRoute(boolean forceStatus) {
@@ -375,20 +379,20 @@ public class NavigationService extends Service {
             return;
         }
 
-        int nearest = nearestIndex(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
-        offRouteMeters = distanceMeters(copy.get(nearest).lat, copy.get(nearest).lon,
-                currentLocation.getLatitude(), currentLocation.getLongitude());
+        RouteMatch match = matchRoute(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
+        int nearest = match.index;
+        offRouteMeters = match.offMeters;
 
         float speedKmh = Math.max(0, currentLocation.getSpeed() * 3.6f);
         requestSpeedLimitIfNeeded(currentLocation);
-        String line = buildScreenLine(copy, nearest, currentLocation);
+        String line = buildScreenLine(copy, match, currentLocation);
 
         Maneuver next = nextManeuver(manCopy, nearest);
         String turn;
         int dist;
 
         if (next != null) {
-            turn = turnFromOpenRouteType(next.type);
+            turn = turnFromOpenRouteType(next.type, next.instruction);
             dist = distanceAlongRoute(copy, nearest, next.endIndex);
             if (dist < 0) dist = (int) Math.round(next.distance);
         } else {
@@ -408,26 +412,54 @@ public class NavigationService extends Service {
             o.put("line", line);
 
             sendToWear(o.toString());
-            updateNotification("Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
+            updateNotification(offRouteMeters > OFF_ROUTE_WARN_METERS ? "Fuori rotta" : "Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
         } catch (JSONException ignored) {}
     }
 
     private Maneuver nextManeuver(ArrayList<Maneuver> list, int nearestRouteIndex) {
         if (list.isEmpty()) return null;
+
+        Maneuver fallback = null;
+
         for (Maneuver m : list) {
-            // type 11 è spesso la partenza: non mostrarlo come prossima svolta.
-            if (m.endIndex > nearestRouteIndex + 1 && m.type != 11) return m;
+            if (m.endIndex <= nearestRouteIndex + 1) continue;
+
+            // 10 = destinazione/arrivo, 11 = partenza/depart.
+            if (m.type == 10 || m.type == 11) continue;
+
+            String instr = m.instruction == null ? "" : m.instruction.toLowerCase();
+
+            // Le rotatorie hanno priorità perché su ORS a volte arrivano come enter/exit
+            // o con testo "roundabout/rotatoria".
+            if (m.type == 7 || m.type == 8 || instr.contains("roundabout") || instr.contains("rotatoria")) {
+                return m;
+            }
+
+            // Evita di mostrare "STRAIGHT" lontani quando c'è una vera manovra dopo.
+            if (m.type == 6) {
+                if (fallback == null) fallback = m;
+                continue;
+            }
+
+            return m;
         }
-        return null;
+
+        return fallback;
     }
 
-    private String turnFromOpenRouteType(int type) {
+    private String turnFromOpenRouteType(int type, String instruction) {
+        String instr = instruction == null ? "" : instruction.toLowerCase();
+
+        if (type == 7 || type == 8 || instr.contains("roundabout") || instr.contains("rotatoria")) {
+            return "ROUND";
+        }
+
         // ORS: 0 left, 1 right, 2 sharp left, 3 sharp right,
         // 4 slight left, 5 slight right, 6 straight,
-        // 7 enter roundabout, 8 exit roundabout, 10 destination, 11 depart.
-        if (type == 0 || type == 2 || type == 4) return "LEFT";
-        if (type == 1 || type == 3 || type == 5) return "RIGHT";
-        if (type == 7 || type == 8) return "ROUND";
+        // 10 destination, 11 depart.
+        if (type == 0 || type == 2 || type == 4 || instr.contains("left") || instr.contains("sinistra")) return "LEFT";
+        if (type == 1 || type == 3 || type == 5 || instr.contains("right") || instr.contains("destra")) return "RIGHT";
+
         return "STRAIGHT";
     }
 
@@ -440,7 +472,7 @@ public class NavigationService extends Service {
         double acc = 0;
         for (int i = start; i < end; i++) {
             acc += distanceMeters(pts.get(i).lat, pts.get(i).lon, pts.get(i + 1).lat, pts.get(i + 1).lon);
-            if (acc > 999) return 999;
+            if (acc > 99999) return 99999;
         }
         return (int) Math.round(acc);
     }
@@ -694,6 +726,61 @@ public class NavigationService extends Service {
         return sb.toString();
     }
 
+    private static RouteMatch matchRoute(ArrayList<LatLon> pts, double lat, double lon) {
+        if (pts == null || pts.isEmpty()) {
+            return new RouteMatch(0, lat, lon, 9999);
+        }
+
+        if (pts.size() == 1) {
+            double d = distanceMeters(lat, lon, pts.get(0).lat, pts.get(0).lon);
+            return new RouteMatch(0, pts.get(0).lat, pts.get(0).lon, d);
+        }
+
+        double best = 1e18;
+        int bestIndex = 0;
+        double bestLat = pts.get(0).lat;
+        double bestLon = pts.get(0).lon;
+
+        double latRad = Math.toRadians(lat);
+        double metersPerDegLat = 111320.0;
+        double metersPerDegLon = Math.cos(latRad) * 111320.0;
+
+        for (int i = 0; i < pts.size() - 1; i++) {
+            LatLon a = pts.get(i);
+            LatLon b = pts.get(i + 1);
+
+            double ax = (a.lon - lon) * metersPerDegLon;
+            double ay = (a.lat - lat) * metersPerDegLat;
+            double bx = (b.lon - lon) * metersPerDegLon;
+            double by = (b.lat - lat) * metersPerDegLat;
+
+            double vx = bx - ax;
+            double vy = by - ay;
+            double len2 = vx * vx + vy * vy;
+
+            double t = 0;
+
+            if (len2 > 0.001) {
+                t = -(ax * vx + ay * vy) / len2;
+                if (t < 0) t = 0;
+                if (t > 1) t = 1;
+            }
+
+            double px = ax + vx * t;
+            double py = ay + vy * t;
+            double d = Math.sqrt(px * px + py * py);
+
+            if (d < best) {
+                best = d;
+                bestIndex = i;
+                bestLat = a.lat + (b.lat - a.lat) * t;
+                bestLon = a.lon + (b.lon - a.lon) * t;
+            }
+        }
+
+        return new RouteMatch(bestIndex, bestLat, bestLon, best);
+    }
+
     private static int nearestIndex(ArrayList<LatLon> pts, double lat, double lon) {
         double best = 1e18;
         int idx = 0;
@@ -760,38 +847,39 @@ public class NavigationService extends Service {
         return (int) Math.min(999, acc);
     }
 
-    private static String buildScreenLine(ArrayList<LatLon> pts, int idx, Location loc) {
+    private static String buildScreenLine(ArrayList<LatLon> pts, RouteMatch match, Location loc) {
+        int idx = match.index;
+
         if (idx >= pts.size()) return "120,140;120,70";
 
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
-        double head;
+        double head = routeHeading(pts, idx);
 
         if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
-            head = loc.getBearing();
-        } else {
-            head = routeHeading(pts, idx);
+            double gpsHead = loc.getBearing();
+            double diff = Math.abs(angleDiff(head, gpsHead));
+
+            if (diff < 35) {
+                head = gpsHead;
+            }
         }
 
         StringBuilder sb = new StringBuilder();
 
-        // V0.8: la linea parte sempre esattamente dalla freccia sul Carlyle.
-        // Usiamo il punto più vicino della rotta come "origine agganciata",
-        // così il GPS leggermente laterale non fa sembrare la freccia fuori strada.
-        LatLon origin = pts.get(Math.max(0, Math.min(idx, pts.size() - 1)));
-        double lat0 = origin.lat;
-        double lon0 = origin.lon;
+        double lat0 = match.lat;
+        double lon0 = match.lon;
 
         int added = 0;
 
         sb.append("120,140");
         added++;
 
-        for (int i = Math.max(idx + 1, 0); i < pts.size() && added < 24; i++) {
+        for (int i = Math.max(idx + 1, 0); i < pts.size() && added < 28; i++) {
             LatLon p = pts.get(i);
             double dist = distanceMeters(lat0, lon0, p.lat, p.lon);
 
-            if (dist < 5) continue;
-            if (dist > 280 && added > 5) break;
+            if (dist < 4) continue;
+            if (dist > 330 && added > 6) break;
 
             double br = bearing(lat0, lon0, p.lat, p.lon);
             double rel = Math.toRadians(angleDiff(head, br));
@@ -813,6 +901,21 @@ public class NavigationService extends Service {
         }
 
         return sb.toString();
+    }
+
+
+    static class RouteMatch {
+        int index;
+        double lat;
+        double lon;
+        double offMeters;
+
+        RouteMatch(int index, double lat, double lon, double offMeters) {
+            this.index = index;
+            this.lat = lat;
+            this.lon = lon;
+            this.offMeters = offMeters;
+        }
     }
 
     static class LatLon {
