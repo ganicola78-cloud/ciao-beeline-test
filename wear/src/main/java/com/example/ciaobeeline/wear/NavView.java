@@ -1,400 +1,847 @@
-package com.example.ciaobeeline.wear;
+package com.example.ciaobeeline.mobile;
 
+import android.Manifest;
+import android.app.Service;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
+import android.os.IBinder;
+import android.os.PowerManager;
 import android.content.Context;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.Paint;
-import android.graphics.Path;
-import android.graphics.PointF;
-import android.graphics.RectF;
-import android.graphics.Typeface;
-import android.view.View;
+import android.content.pm.ServiceInfo;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.os.Handler;
+import android.os.Looper;
 
+import com.google.android.gms.wearable.Node;
+import com.google.android.gms.wearable.Wearable;
+
+import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 
-public class NavView extends View {
+public class NavigationService extends Service {
+    private static final String PATH = "/nav_update";
+    private static final String PREFS = "ciao_beeline_prefs";
+    private static final String PREF_API_KEY = "ors_api_key";
+    private static final String PREF_DESTINATION = "destination_text";
+    public static final String ACTION_START = "com.example.ciaobeeline.START_NAV";
+    public static final String ACTION_STOP = "com.example.ciaobeeline.STOP_NAV";
+    private static final String CHANNEL_ID = "ciao_beeline_navigation";
+    private static final int NOTIFICATION_ID = 1001;
 
-    private final Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint routePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint sideRoadPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint progressPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    // V0.11: foreground service + svolte ORS + OSM speed limit + distanza anche oltre 999 m
+    private static final double OFF_ROUTE_RECALC_METERS = 22.0;
+    private static final double OFF_ROUTE_WARN_METERS = 35.0;
+    private static final long RECALC_COOLDOWN_MS = 3000;
+    private static final long PERIODIC_RECALC_MS = 60000;
+    private static final float GPS_BEARING_MIN_SPEED_KMH = 14.0f;
+    private static final long SPEED_LIMIT_REFRESH_MS = 30000;
 
-    private String mode = "WAIT";
-    private String turn = "RIGHT";
-    private int dist = 300;
-    private int speed = 0;
-    private int limit = -1;
+    private LocationManager locationManager;
+    private Location currentLocation;
 
-    // Linea demo/default
-    private String line = "120,200;120,165;145,140;145,95;105,60";
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ArrayList<LatLon> route = new ArrayList<>();
+    private final ArrayList<Maneuver> maneuvers = new ArrayList<>();
 
-    public NavView(Context c) {
-        super(c);
+    private boolean running = false;
+    private boolean routeRequestInProgress = false;
+    private long lastRouteMs = 0;
+    private long lastSendMs = 0;
+    private double offRouteMeters = 9999;
+    private int lastSpeedLimit = -1;
+    private long lastSpeedLimitMs = 0;
+    private boolean speedLimitRequestInProgress = false;
+    private long navSeq = 0;
+    private LatLon lastDestination = null;
+    private String lastDestinationText = "";
+    private String apiKey = "";
+    private String destinationText = "";
+    private PowerManager.WakeLock wakeLock;
 
-        bgPaint.setStyle(Paint.Style.FILL);
-        bgPaint.setColor(Color.BLACK);
+    @Override
+    public void onCreate() {
+        super.onCreate();
 
-        routePaint.setStyle(Paint.Style.STROKE);
-        routePaint.setColor(Color.WHITE);
-        routePaint.setStrokeWidth(10f);
-        routePaint.setStrokeCap(Paint.Cap.ROUND);
-        routePaint.setStrokeJoin(Paint.Join.ROUND);
+        locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
+        createNotificationChannel();
 
-        sideRoadPaint.setStyle(Paint.Style.STROKE);
-        sideRoadPaint.setColor(Color.rgb(170, 170, 170));
-        sideRoadPaint.setStrokeWidth(3.5f);
-        sideRoadPaint.setStrokeCap(Paint.Cap.ROUND);
-        sideRoadPaint.setStrokeJoin(Paint.Join.ROUND);
-
-        fillPaint.setStyle(Paint.Style.FILL);
-        fillPaint.setColor(Color.WHITE);
-
-        strokePaint.setStyle(Paint.Style.STROKE);
-        strokePaint.setColor(Color.BLACK);
-        strokePaint.setStrokeWidth(3f);
-        strokePaint.setStrokeCap(Paint.Cap.ROUND);
-        strokePaint.setStrokeJoin(Paint.Join.ROUND);
-
-        textPaint.setColor(Color.WHITE);
-        textPaint.setTextAlign(Paint.Align.CENTER);
-
-        progressPaint.setStyle(Paint.Style.STROKE);
-        progressPaint.setColor(Color.rgb(210, 210, 210));
-        progressPaint.setStrokeWidth(4f);
-        progressPaint.setStrokeCap(Paint.Cap.ROUND);
-    }
-
-    public void update(String json) {
         try {
-            JSONObject o = new JSONObject(json);
-            mode = o.optString("mode", mode);
-            turn = o.optString("turn", turn);
-            dist = o.optInt("dist", dist);
-            speed = o.optInt("speed", speed);
-            limit = o.optInt("limit", limit);
-            line = o.optString("line", line);
-            postInvalidate();
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CiaoBeeline:NavigationWakeLock");
+            wakeLock.setReferenceCounted(false);
         } catch (Exception ignored) {
         }
     }
 
     @Override
-    protected void onDraw(Canvas c) {
-        super.onDraw(c);
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        String action = intent != null ? intent.getAction() : ACTION_START;
 
-        int w = getWidth();
-        int h = getHeight();
-
-        float scale = Math.min(w, h) / 240f;
-
-        c.save();
-        c.scale(scale, scale);
-        c.translate((w / scale - 240f) / 2f, (h / scale - 240f) / 2f);
-
-        c.drawCircle(120, 120, 120, bgPaint);
-
-        if ("WAIT".equals(mode)) {
-            drawWait(c);
-        } else if ("OFF_ROUTE".equals(mode)) {
-            drawOffRoute(c);
-        } else if ("STOP".equals(mode)) {
-            drawStop(c);
-        } else {
-            drawNav(c);
+        if (ACTION_STOP.equals(action)) {
+            stopRouting();
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
         }
 
-        c.restore();
+        startForegroundCompat("Navigazione attiva", "GPS e invio dati al Carlyle attivi");
+        startRouting();
+
+        return START_STICKY;
     }
 
-    private void drawWait(Canvas c) {
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(22);
-        c.drawText("CIAO", 120, 95, textPaint);
-
-        textPaint.setTextSize(18);
-        c.drawText("BEELINE", 120, 120, textPaint);
-
-        textPaint.setTypeface(Typeface.DEFAULT);
-        textPaint.setTextSize(13);
-        c.drawText("apri app telefono", 120, 155, textPaint);
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
     }
 
-    private void drawStop(Canvas c) {
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(22);
-        c.drawText("NAV", 120, 98, textPaint);
-        c.drawText("STOP", 120, 126, textPaint);
+    private void startRouting() {
+        loadPrefsForService();
+        running = true;
+        routeRequestInProgress = false;
+        acquireWakeLock();
 
-        textPaint.setTypeface(Typeface.DEFAULT);
-        textPaint.setTextSize(13);
-        c.drawText("avvia dal telefono", 120, 156, textPaint);
-    }
+        synchronized (route) { route.clear(); }
+        synchronized (maneuvers) { maneuvers.clear(); }
 
-    private void drawOffRoute(Canvas c) {
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(20);
-        c.drawText("FUORI", 120, 76, textPaint);
-        c.drawText("TRACCIA", 120, 101, textPaint);
+        lastDestination = null;
+        lastDestinationText = "";
+        lastRouteMs = 0;
+        lastSendMs = 0;
+        offRouteMeters = 9999;
+        lastSpeedLimit = -1;
+        lastSpeedLimitMs = 0;
+        speedLimitRequestInProgress = false;
 
-        textPaint.setTextSize(48);
-        c.drawText("↖", 120, 153, textPaint);
-
-        textPaint.setTextSize(22);
-        c.drawText(dist + " m", 120, 190, textPaint);
-    }
-
-    private void drawNav(Canvas c) {
-        RectF routeBox = new RectF(18, 18, 222, 148);
-
-        ArrayList<PointF> screenPts = transformedLine(routeBox);
-
-        drawSideRoads(c, screenPts);
-        drawRoutePath(c, screenPts);
-        drawRoundaboutHint(c);
-        drawTriangleAlignedToRoute(c, screenPts, 120, 140, 16);
-        drawBottom(c);
-        drawSpeedLimit(c);
-
-        if ("REROUTE".equals(mode)) {
-            textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-            textPaint.setTextSize(12);
-            c.drawText("ricalcolo", 120, 20, textPaint);
-        }
-    }
-
-    private void drawRoutePath(Canvas c, ArrayList<PointF> pts) {
-        if (pts.size() < 2) return;
-
-        Path path = new Path();
-        path.moveTo(pts.get(0).x, pts.get(0).y);
-
-        for (int i = 1; i < pts.size(); i++) {
-            path.lineTo(pts.get(i).x, pts.get(i).y);
-        }
-
-        c.drawPath(path, routePaint);
-    }
-
-    private void drawSideRoads(Canvas c, ArrayList<PointF> pts) {
-        if (pts.size() < 3) return;
-
-        int drawn = 0;
-
-        for (int i = 1; i < pts.size() - 1 && drawn < 5; i += 2) {
-            PointF prev = pts.get(i - 1);
-            PointF cur = pts.get(i);
-            PointF next = pts.get(i + 1);
-
-            float vx = next.x - prev.x;
-            float vy = next.y - prev.y;
-
-            float len = (float) Math.sqrt(vx * vx + vy * vy);
-            if (len < 8f) continue;
-
-            vx /= len;
-            vy /= len;
-
-            float px = -vy;
-            float py = vx;
-
-            // Non disegnare laterali troppo in basso, per non coprire i numeri.
-            if (cur.y > 122) continue;
-
-            float sideLen = 26f;
-
-            // Alterna lato destro/sinistro per simulare incroci Beeline.
-            int sign = (i % 4 == 1) ? 1 : -1;
-
-            float x1 = cur.x;
-            float y1 = cur.y;
-            float x2 = cur.x + px * sideLen * sign;
-            float y2 = cur.y + py * sideLen * sign;
-
-            // Mantieni dentro il quadrante utile.
-            if (x2 < 22 || x2 > 218 || y2 < 20 || y2 > 128) continue;
-
-            c.drawLine(x1, y1, x2, y2, sideRoadPaint);
-
-            // Aggiunge una piccola seconda laterale sull'altro lato vicino alle curve,
-            // visivamente simile alle stradine secondarie nel Beeline.
-            if (Math.abs(angleAt(prev, cur, next)) > 22 && drawn < 4) {
-                float x3 = cur.x - px * 18f * sign;
-                float y3 = cur.y - py * 18f * sign;
-                if (x3 >= 22 && x3 <= 218 && y3 >= 20 && y3 <= 128) {
-                    c.drawLine(cur.x, cur.y, x3, y3, sideRoadPaint);
-                }
-            }
-
-            drawn++;
-        }
-    }
-
-    private float angleAt(PointF a, PointF b, PointF c) {
-        float a1 = (float) Math.atan2(b.y - a.y, b.x - a.x);
-        float a2 = (float) Math.atan2(c.y - b.y, c.x - b.x);
-        float d = (float) Math.toDegrees(a2 - a1);
-
-        while (d > 180) d -= 360;
-        while (d < -180) d += 360;
-
-        return d;
-    }
-
-    private ArrayList<PointF> transformedLine(RectF box) {
-        ArrayList<PointF> pts = parseLine(line);
-        ArrayList<PointF> out = new ArrayList<>();
-
-        // V0.8: niente ridimensionamento automatico.
-        // Le coordinate arrivano già dal telefono con partenza 120,140,
-        // quindi la freccia resta agganciata alla riga bianca.
-        for (PointF p : pts) {
-            float x = Math.max(box.left, Math.min(box.right, p.x));
-            float y = Math.max(box.top, Math.min(box.bottom, p.y));
-            out.add(new PointF(x, y));
-        }
-
-        return out;
-    }
-
-    private void drawRoundaboutHint(Canvas c) {
-        if (!"ROUND".equals(turn)) return;
-
-        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(7f);
-        p.setStrokeCap(Paint.Cap.ROUND);
-        p.setColor(Color.WHITE);
-
-        RectF r = new RectF(93, 50, 147, 104);
-        c.drawArc(r, 35, 300, false, p);
-
-        // Piccola uscita verso l'alto/destra per rendere visibile la rotatoria.
-        c.drawLine(138, 60, 166, 42, p);
-    }
-
-    private void drawSpeedLimit(Canvas c) {
-        if (limit <= 0) return;
-
-        float cx = 184f;
-        float cy = 174f;
-        float r = 17f;
-
-        Paint circlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-
-        circlePaint.setStyle(Paint.Style.FILL);
-        circlePaint.setColor(Color.WHITE);
-        c.drawCircle(cx, cy, r, circlePaint);
-
-        circlePaint.setStyle(Paint.Style.STROKE);
-        circlePaint.setStrokeWidth(4f);
-        circlePaint.setColor(Color.rgb(220, 45, 45));
-        c.drawCircle(cx, cy, r - 2f, circlePaint);
-
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(limit >= 100 ? 12f : 15f);
-        textPaint.setColor(Color.BLACK);
-        c.drawText(String.valueOf(limit), cx, cy + 5f, textPaint);
-        textPaint.setColor(Color.WHITE);
-    }
-
-
-    private void drawTriangleAlignedToRoute(Canvas c, ArrayList<PointF> pts, float cx, float cy, float halfWidth) {
-        float angle = routeStartAngleDegrees(pts, cx, cy);
-
-        c.save();
-        c.rotate(angle, cx, cy);
-        drawTriangle(c, cx, cy, halfWidth);
-        c.restore();
-    }
-
-    private float routeStartAngleDegrees(ArrayList<PointF> pts, float cx, float cy) {
-        if (pts == null || pts.size() < 2) {
-            return 0f;
-        }
-
-        PointF best = null;
-        float bestDist = Float.MAX_VALUE;
-
-        for (PointF p : pts) {
-            float dx = p.x - cx;
-            float dy = p.y - cy;
-            float d = (float) Math.sqrt(dx * dx + dy * dy);
-
-            if (d > 8f && d < bestDist) {
-                best = p;
-                bestDist = d;
-            }
-        }
-
-        if (best == null) {
-            best = pts.get(Math.min(1, pts.size() - 1));
-        }
-
-        float dx = best.x - cx;
-        float dy = best.y - cy;
-
-        if (Math.abs(dx) < 1f && Math.abs(dy) < 1f) {
-            return 0f;
-        }
-
-        // La freccia base punta verso l'alto. Con atan2(dx, -dy) otteniamo
-        // la rotazione necessaria per allinearla al primo tratto della rotta.
-        return (float) Math.toDegrees(Math.atan2(dx, -dy));
-    }
-
-    private void drawTriangle(Canvas c, float cx, float cy, float halfWidth) {
-        float height = 28f;
-
-        Path tri = new Path();
-        tri.moveTo(cx, cy - height / 2f);
-        tri.lineTo(cx - halfWidth, cy + height / 2f);
-        tri.lineTo(cx + halfWidth, cy + height / 2f);
-        tri.close();
-
-        c.drawPath(tri, fillPaint);
-        c.drawPath(tri, strokePaint);
-    }
-
-    private void drawBottom(Canvas c) {
-        float distY = 182f;
-        float speedY = 207f;
-
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(24);
-        c.drawText(turnSymbol(turn) + " " + dist + " m", 120, distY, textPaint);
-
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(22);
-        c.drawText(speed + " km/h", 120, speedY, textPaint);
-    }
-
-    private String turnSymbol(String t) {
-        if ("LEFT".equals(t)) return "↰";
-        if ("RIGHT".equals(t)) return "↱";
-        if ("ROUND".equals(t)) return "↻";
-        return "↑";
-    }
-
-    private ArrayList<PointF> parseLine(String s) {
-        ArrayList<PointF> out = new ArrayList<>();
         try {
-            String[] pairs = s.split(";");
-            for (String pair : pairs) {
-                String[] xy = pair.split(",");
-                if (xy.length == 2) {
-                    out.add(new PointF(
-                            Float.parseFloat(xy[0].trim()),
-                            Float.parseFloat(xy[1].trim())
-                    ));
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 700, 1, listener);
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1000, 1, listener);
+            }
+
+            Location lastGps = null;
+            Location lastNetwork = null;
+
+            try {
+                lastGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                lastNetwork = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            } catch (SecurityException ignored) {}
+
+            currentLocation = bestLocation(lastGps, lastNetwork);
+
+            if (currentLocation != null) {
+                updateNotification("GPS disponibile", "Calcolo rotta...");
+                requestRoute(true);
+            } else {
+                updateNotification("Navigazione attiva", "Attendo GPS del telefono...");
+            }
+        } catch (Exception e) {
+            updateNotification("Errore GPS", String.valueOf(e.getMessage()));
+        }
+    }
+
+    private Location bestLocation(Location a, Location b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        return a.getTime() >= b.getTime() ? a : b;
+    }
+
+    private void stopRouting() {
+        running = false;
+        routeRequestInProgress = false;
+        releaseWakeLock();
+        try { locationManager.removeUpdates(listener); } catch (Exception ignored) {}
+        updateNotification("Navigazione fermata", "");
+        sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,140;120,70\"}");
+    }
+
+
+    @Override
+    public void onDestroy() {
+        stopRouting();
+        super.onDestroy();
+    }
+
+    private final LocationListener listener = loc -> {
+        currentLocation = loc;
+        if (!running) return;
+
+        long now = System.currentTimeMillis();
+
+        if (route.isEmpty()) {
+            requestRoute(true);
+            return;
+        }
+
+        updateOffRouteDistance();
+
+        boolean offRoute = offRouteMeters > OFF_ROUTE_RECALC_METERS;
+        boolean cooldownPassed = now - lastRouteMs > RECALC_COOLDOWN_MS;
+        boolean periodicRefresh = now - lastRouteMs > PERIODIC_RECALC_MS;
+
+        if ((offRoute && cooldownPassed) || periodicRefresh) {
+            requestRoute(true);
+        } else {
+            sendNavUpdate(false);
+        }
+    };
+
+    private void updateOffRouteDistance() {
+        if (currentLocation == null) return;
+        ArrayList<LatLon> copy;
+        synchronized (route) { copy = new ArrayList<>(route); }
+        if (copy.isEmpty()) return;
+        int nearest = nearestIndex(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
+        offRouteMeters = distanceMeters(copy.get(nearest).lat, copy.get(nearest).lon,
+                currentLocation.getLatitude(), currentLocation.getLongitude());
+    }
+
+    private void requestRoute(boolean forceStatus) {
+        if (currentLocation == null) return;
+        if (routeRequestInProgress) return;
+
+        final String key = apiKey.trim();
+        final String destinationText = this.destinationText.trim();
+
+        if (key.length() < 8) {
+            updateNotification("Errore", "Inserisci API key OpenRouteService.");
+            return;
+        }
+
+        if (destinationText.length() < 3) {
+            updateNotification("Errore", "Inserisci una destinazione.");
+            return;
+        }
+
+        routeRequestInProgress = true;
+        lastRouteMs = System.currentTimeMillis();
+
+        if (forceStatus) {
+            updateNotification("Ricalcolo rotta", "");
+            sendToWear("{\"mode\":\"REROUTE\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,140;120,105;120,70;120,40\"}");
+        }
+
+        new Thread(() -> {
+            try {
+                LatLon dest;
+                if (lastDestination != null && destinationText.equals(lastDestinationText)) {
+                    dest = lastDestination;
+                } else {
+                    dest = geocodeDestination(key, destinationText);
+                    lastDestination = dest;
+                    lastDestinationText = destinationText;
                 }
+
+                RouteResult result = requestDirections(key, dest);
+
+                synchronized (route) {
+                    route.clear();
+                    route.addAll(result.points);
+                }
+                synchronized (maneuvers) {
+                    maneuvers.clear();
+                    maneuvers.addAll(result.maneuvers);
+                }
+
+                handler.post(() -> {
+                    routeRequestInProgress = false;
+                    updateNotification("Rotta aggiornata", destinationText + " - svolte: " + result.maneuvers.size());
+                    sendNavUpdate(true);
+                });
+            } catch (Exception e) {
+                handler.post(() -> {
+                    routeRequestInProgress = false;
+                    updateNotification("Errore routing", String.valueOf(e.getMessage()));
+                });
+            }
+        }).start();
+    }
+
+    private LatLon geocodeDestination(String key, String destinationText) throws Exception {
+        String encoded = URLEncoder.encode(destinationText, "UTF-8");
+        URL url = new URL("https://api.openrouteservice.org/geocode/search?api_key=" + key + "&text=" + encoded + "&size=1");
+
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestMethod("GET");
+        c.setRequestProperty("Accept", "application/json");
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+
+        if (c.getResponseCode() >= 400) throw new RuntimeException("Geocoding: " + txt);
+
+        JSONObject json = new JSONObject(txt);
+        JSONArray features = json.getJSONArray("features");
+        if (features.length() == 0) throw new RuntimeException("Destinazione non trovata. Prova con indirizzo più preciso.");
+
+        JSONArray coords = features.getJSONObject(0).getJSONObject("geometry").getJSONArray("coordinates");
+        return new LatLon(coords.getDouble(1), coords.getDouble(0));
+    }
+
+    private RouteResult requestDirections(String key, LatLon dest) throws Exception {
+        URL url = new URL("https://api.openrouteservice.org/v2/directions/driving-car/geojson");
+
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Authorization", key);
+        c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+
+        String body = "{\"coordinates\":[[" +
+                currentLocation.getLongitude() + "," + currentLocation.getLatitude() + "],[" +
+                dest.lon + "," + dest.lat + "]]," +
+                "\"preference\":\"shortest\"," +
+                "\"options\":{\"avoid_features\":[\"highways\",\"tollways\"]}}";
+
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+
+        if (c.getResponseCode() >= 400) throw new RuntimeException(txt);
+
+        JSONObject json = new JSONObject(txt);
+        JSONObject feature = json.getJSONArray("features").getJSONObject(0);
+        JSONArray coords = feature.getJSONObject("geometry").getJSONArray("coordinates");
+
+        ArrayList<LatLon> newRoute = new ArrayList<>();
+        for (int i = 0; i < coords.length(); i++) {
+            JSONArray p = coords.getJSONArray(i);
+            newRoute.add(new LatLon(p.getDouble(1), p.getDouble(0)));
+        }
+
+        ArrayList<Maneuver> newManeuvers = new ArrayList<>();
+        JSONArray segments = feature.getJSONObject("properties").optJSONArray("segments");
+
+        if (segments != null) {
+            for (int s = 0; s < segments.length(); s++) {
+                JSONArray steps = segments.getJSONObject(s).optJSONArray("steps");
+                if (steps == null) continue;
+
+                for (int i = 0; i < steps.length(); i++) {
+                    JSONObject step = steps.getJSONObject(i);
+                    JSONArray wp = step.optJSONArray("way_points");
+                    if (wp == null || wp.length() < 2) continue;
+
+                    int startIndex = wp.optInt(0, 0);
+                    int endIndex = wp.optInt(1, startIndex);
+                    int type = step.optInt("type", -1);
+                    double distance = step.optDouble("distance", 0);
+                    String instruction = step.optString("instruction", "");
+
+                    newManeuvers.add(new Maneuver(startIndex, endIndex, type, distance, instruction));
+                }
+            }
+        }
+
+        return new RouteResult(newRoute, newManeuvers);
+    }
+
+    private void sendNavUpdate(boolean recalculated) {
+        if (currentLocation == null) return;
+
+        long now = System.currentTimeMillis();
+        if (!recalculated && now - lastSendMs < 500) return;
+        lastSendMs = now;
+
+        ArrayList<LatLon> copy;
+        synchronized (route) { copy = new ArrayList<>(route); }
+        ArrayList<Maneuver> manCopy;
+        synchronized (maneuvers) { manCopy = new ArrayList<>(maneuvers); }
+
+        if (copy.isEmpty()) {
+            sendDemo();
+            return;
+        }
+
+        int nearest = nearestIndex(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
+        offRouteMeters = distanceMeters(copy.get(nearest).lat, copy.get(nearest).lon,
+                currentLocation.getLatitude(), currentLocation.getLongitude());
+
+        float speedKmh = Math.max(0, currentLocation.getSpeed() * 3.6f);
+        requestSpeedLimitIfNeeded(currentLocation);
+        String line = buildScreenLine(copy, nearest, currentLocation);
+
+        Maneuver next = nextManeuver(manCopy, nearest);
+        String turn;
+        int dist;
+
+        if (next != null) {
+            turn = turnFromOpenRouteType(next.type);
+            dist = distanceAlongRoute(copy, nearest, next.endIndex);
+            if (dist < 0) dist = (int) Math.round(next.distance);
+        } else {
+            turn = inferTurn(copy, nearest);
+            dist = distanceToNextBend(copy, nearest);
+        }
+
+        try {
+            JSONObject o = new JSONObject();
+            o.put("mode", offRouteMeters > OFF_ROUTE_WARN_METERS ? "OFF_ROUTE" : "NAV");
+            o.put("seq", ++navSeq);
+            o.put("recalculated", recalculated);
+            o.put("speed", Math.round(speedKmh));
+            o.put("dist", Math.max(0, Math.min(99999, dist)));
+            o.put("turn", turn);
+            o.put("limit", lastSpeedLimit);
+            o.put("line", line);
+
+            sendToWear(o.toString());
+            updateNotification("Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
+        } catch (JSONException ignored) {}
+    }
+
+    private Maneuver nextManeuver(ArrayList<Maneuver> list, int nearestRouteIndex) {
+        if (list.isEmpty()) return null;
+        for (Maneuver m : list) {
+            // type 11 è spesso la partenza: non mostrarlo come prossima svolta.
+            if (m.endIndex > nearestRouteIndex + 1 && m.type != 11) return m;
+        }
+        return null;
+    }
+
+    private String turnFromOpenRouteType(int type) {
+        // ORS: 0 left, 1 right, 2 sharp left, 3 sharp right,
+        // 4 slight left, 5 slight right, 6 straight,
+        // 7 enter roundabout, 8 exit roundabout, 10 destination, 11 depart.
+        if (type == 0 || type == 2 || type == 4) return "LEFT";
+        if (type == 1 || type == 3 || type == 5) return "RIGHT";
+        if (type == 7 || type == 8) return "ROUND";
+        return "STRAIGHT";
+    }
+
+    private int distanceAlongRoute(ArrayList<LatLon> pts, int from, int to) {
+        if (pts.isEmpty()) return -1;
+        int start = Math.max(0, Math.min(from, pts.size() - 1));
+        int end = Math.max(0, Math.min(to, pts.size() - 1));
+        if (end <= start) return 0;
+
+        double acc = 0;
+        for (int i = start; i < end; i++) {
+            acc += distanceMeters(pts.get(i).lat, pts.get(i).lon, pts.get(i + 1).lat, pts.get(i + 1).lon);
+            if (acc > 999) return 999;
+        }
+        return (int) Math.round(acc);
+    }
+
+    private void requestSpeedLimitIfNeeded(Location loc) {
+        if (loc == null) return;
+
+        long now = System.currentTimeMillis();
+
+        if (speedLimitRequestInProgress) return;
+        if (now - lastSpeedLimitMs < SPEED_LIMIT_REFRESH_MS) return;
+
+        speedLimitRequestInProgress = true;
+        lastSpeedLimitMs = now;
+
+        final double lat = loc.getLatitude();
+        final double lon = loc.getLongitude();
+
+        new Thread(() -> {
+            int found = -1;
+
+            try {
+                found = requestSpeedLimitFromOsm(lat, lon);
+            } catch (Exception ignored) {
+            }
+
+            final int result = found;
+
+            handler.post(() -> {
+                speedLimitRequestInProgress = false;
+
+                if (result > 0) {
+                    lastSpeedLimit = result;
+                }
+            });
+        }).start();
+    }
+
+    private int requestSpeedLimitFromOsm(double lat, double lon) throws Exception {
+        URL url = new URL("https://overpass-api.de/api/interpreter");
+
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8");
+
+        String query =
+                "[out:json][timeout:5];" +
+                "way(around:60," + lat + "," + lon + ")[\"highway\"][\"maxspeed\"];" +
+                "out tags 8;";
+
+        String body = "data=" + URLEncoder.encode(query, "UTF-8");
+
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+
+        if (c.getResponseCode() >= 400) {
+            return -1;
+        }
+
+        JSONObject json = new JSONObject(txt);
+        JSONArray elements = json.optJSONArray("elements");
+
+        if (elements == null || elements.length() == 0) {
+            return -1;
+        }
+
+        for (int i = 0; i < elements.length(); i++) {
+            JSONObject tags = elements.getJSONObject(i).optJSONObject("tags");
+
+            if (tags == null) continue;
+
+            String raw = tags.optString("maxspeed", "");
+            int parsed = parseSpeedLimit(raw);
+
+            if (parsed > 0) {
+                return parsed;
+            }
+        }
+
+        return -1;
+    }
+
+    private int parseSpeedLimit(String raw) {
+        if (raw == null) return -1;
+
+        String s = raw.trim().toLowerCase();
+
+        if (s.length() == 0) return -1;
+        if (s.contains("signals")) return -1;
+        if (s.contains("none")) return -1;
+        if (s.contains("walk")) return -1;
+
+        boolean mph = s.contains("mph");
+
+        StringBuilder digits = new StringBuilder();
+
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+
+            if (ch >= '0' && ch <= '9') {
+                digits.append(ch);
+            } else if (digits.length() > 0) {
+                break;
+            }
+        }
+
+        if (digits.length() == 0) return -1;
+
+        try {
+            int value = Integer.parseInt(digits.toString());
+
+            if (mph) {
+                value = (int) Math.round(value * 1.60934);
+            }
+
+            if (value < 5 || value > 140) return -1;
+
+            return value;
+        } catch (Exception ignored) {
+            return -1;
+        }
+    }
+
+    private void sendDemo() {
+        String demoJson = "{\"mode\":\"NAV\",\"speed\":36,\"dist\":300,\"turn\":\"RIGHT\",\"limit\":50,\"line\":\"120,140;120,110;145,92;145,60;105,40\"}";
+        sendToWear(demoJson);
+        updateNotification("Demo inviata", "Carlyle aggiornato.");
+    }
+
+    private void sendToWear(String msg) {
+        com.google.android.gms.wearable.PutDataMapRequest mapRequest =
+                com.google.android.gms.wearable.PutDataMapRequest.create(PATH);
+        mapRequest.getDataMap().putString("json", msg);
+        mapRequest.getDataMap().putLong("ts", System.currentTimeMillis());
+        com.google.android.gms.wearable.PutDataRequest request = mapRequest.asPutDataRequest().setUrgent();
+        Wearable.getDataClient(this).putDataItem(request);
+
+        Wearable.getNodeClient(this).getConnectedNodes().addOnSuccessListener(nodes -> {
+            for (Node n : nodes) {
+                Wearable.getMessageClient(this).sendMessage(n.getId(), PATH, msg.getBytes(StandardCharsets.UTF_8));
+            }
+        });
+    }
+
+    private void loadPrefsForService() {
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        apiKey = p.getString(PREF_API_KEY, "");
+        destinationText = p.getString(PREF_DESTINATION, "");
+    }
+
+    private void acquireWakeLock() {
+        try {
+            if (wakeLock != null && !wakeLock.isHeld()) {
+                wakeLock.acquire(3 * 60 * 60 * 1000L);
             }
         } catch (Exception ignored) {
         }
-        return out;
+    }
+
+    private void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void createNotificationChannel() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID,
+                    "Ciao Beeline Navigation",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            channel.setDescription("Navigazione GPS attiva verso Carlyle");
+
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
+        }
+    }
+
+    private void startForegroundCompat(String title, String text) {
+        Notification notification = buildNotification(title, text);
+
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
+    }
+
+    private void updateNotification(String title, String text) {
+        try {
+            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager != null) {
+                manager.notify(NOTIFICATION_ID, buildNotification(title, text));
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private Notification buildNotification(String title, String text) {
+        Intent openIntent = new Intent(this, MainActivity.class);
+        PendingIntent openPendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                openIntent,
+                android.os.Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0
+        );
+
+        Intent stopIntent = new Intent(this, NavigationService.class);
+        stopIntent.setAction(ACTION_STOP);
+        PendingIntent stopPendingIntent = PendingIntent.getService(
+                this,
+                1,
+                stopIntent,
+                android.os.Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0
+        );
+
+        Notification.Builder builder;
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            builder = new Notification.Builder(this, CHANNEL_ID);
+        } else {
+            builder = new Notification.Builder(this);
+        }
+
+        builder
+                .setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                .setOngoing(true)
+                .setContentIntent(openPendingIntent)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent);
+
+        return builder.build();
+    }
+
+    private static String readAll(InputStream is) throws IOException {
+        BufferedReader br = new BufferedReader(new InputStreamReader(is));
+        StringBuilder sb = new StringBuilder();
+        String l;
+        while ((l = br.readLine()) != null) sb.append(l);
+        return sb.toString();
+    }
+
+    private static int nearestIndex(ArrayList<LatLon> pts, double lat, double lon) {
+        double best = 1e18;
+        int idx = 0;
+        for (int i = 0; i < pts.size(); i++) {
+            double d = distanceMeters(lat, lon, pts.get(i).lat, pts.get(i).lon);
+            if (d < best) {
+                best = d;
+                idx = i;
+            }
+        }
+        return idx;
+    }
+
+    private static double distanceMeters(double la1, double lo1, double la2, double lo2) {
+        double R = 6371000;
+        double p1 = Math.toRadians(la1);
+        double p2 = Math.toRadians(la2);
+        double dp = Math.toRadians(la2 - la1);
+        double dl = Math.toRadians(lo2 - lo1);
+        double a = Math.sin(dp / 2) * Math.sin(dp / 2) +
+                Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    private static double bearing(double la1, double lo1, double la2, double lo2) {
+        double y = Math.sin(Math.toRadians(lo2 - lo1)) * Math.cos(Math.toRadians(la2));
+        double x = Math.cos(Math.toRadians(la1)) * Math.sin(Math.toRadians(la2)) -
+                Math.sin(Math.toRadians(la1)) * Math.cos(Math.toRadians(la2)) * Math.cos(Math.toRadians(lo2 - lo1));
+        return (Math.toDegrees(Math.atan2(y, x)) + 360) % 360;
+    }
+
+    private static double angleDiff(double a, double b) {
+        return (b - a + 540) % 360 - 180;
+    }
+
+    private static double routeHeading(ArrayList<LatLon> pts, int idx) {
+        int a = Math.min(idx + 1, pts.size() - 1);
+        int b = Math.min(idx + 6, pts.size() - 1);
+        if (a == b) return 0;
+        return bearing(pts.get(a).lat, pts.get(a).lon, pts.get(b).lat, pts.get(b).lon);
+    }
+
+    private static String inferTurn(ArrayList<LatLon> pts, int idx) {
+        if (idx + 8 >= pts.size()) return "STRAIGHT";
+        int a = Math.min(idx + 3, pts.size() - 1);
+        int b = Math.min(idx + 8, pts.size() - 1);
+        double b1 = bearing(pts.get(idx).lat, pts.get(idx).lon, pts.get(a).lat, pts.get(a).lon);
+        double b2 = bearing(pts.get(a).lat, pts.get(a).lon, pts.get(b).lat, pts.get(b).lon);
+        double d = angleDiff(b1, b2);
+        if (d > 35) return "RIGHT";
+        if (d < -35) return "LEFT";
+        return "STRAIGHT";
+    }
+
+    private static int distanceToNextBend(ArrayList<LatLon> pts, int idx) {
+        double acc = 0;
+        for (int i = idx; i < pts.size() - 8; i++) {
+            double b1 = bearing(pts.get(i).lat, pts.get(i).lon, pts.get(i + 3).lat, pts.get(i + 3).lon);
+            double b2 = bearing(pts.get(i + 3).lat, pts.get(i + 3).lon, pts.get(i + 8).lat, pts.get(i + 8).lon);
+            if (Math.abs(angleDiff(b1, b2)) > 35) return (int) Math.max(20, acc);
+            acc += distanceMeters(pts.get(i).lat, pts.get(i).lon, pts.get(i + 1).lat, pts.get(i + 1).lon);
+            if (acc > 999) break;
+        }
+        return (int) Math.min(999, acc);
+    }
+
+    private static String buildScreenLine(ArrayList<LatLon> pts, int idx, Location loc) {
+        if (idx >= pts.size()) return "120,140;120,70";
+
+        float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
+        double head;
+
+        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
+            head = loc.getBearing();
+        } else {
+            head = routeHeading(pts, idx);
+        }
+
+        StringBuilder sb = new StringBuilder();
+
+        // V0.8: la linea parte sempre esattamente dalla freccia sul Carlyle.
+        // Usiamo il punto più vicino della rotta come "origine agganciata",
+        // così il GPS leggermente laterale non fa sembrare la freccia fuori strada.
+        LatLon origin = pts.get(Math.max(0, Math.min(idx, pts.size() - 1)));
+        double lat0 = origin.lat;
+        double lon0 = origin.lon;
+
+        int added = 0;
+
+        sb.append("120,140");
+        added++;
+
+        for (int i = Math.max(idx + 1, 0); i < pts.size() && added < 24; i++) {
+            LatLon p = pts.get(i);
+            double dist = distanceMeters(lat0, lon0, p.lat, p.lon);
+
+            if (dist < 5) continue;
+            if (dist > 280 && added > 5) break;
+
+            double br = bearing(lat0, lon0, p.lat, p.lon);
+            double rel = Math.toRadians(angleDiff(head, br));
+            double x = Math.sin(rel) * dist;
+            double y = Math.cos(rel) * dist;
+
+            int sx = (int) Math.round(120 + x * 0.58);
+            int sy = (int) Math.round(140 - y * 0.58);
+
+            sx = Math.max(18, Math.min(222, sx));
+            sy = Math.max(18, Math.min(148, sy));
+
+            sb.append(';').append(sx).append(',').append(sy);
+            added++;
+        }
+
+        if (added < 2) {
+            sb.append(";120,70");
+        }
+
+        return sb.toString();
+    }
+
+    static class LatLon {
+        double lat;
+        double lon;
+        LatLon(double a, double b) { lat = a; lon = b; }
+    }
+
+    static class Maneuver {
+        int startIndex;
+        int endIndex;
+        int type;
+        double distance;
+        String instruction;
+        Maneuver(int startIndex, int endIndex, int type, double distance, String instruction) {
+            this.startIndex = startIndex;
+            this.endIndex = endIndex;
+            this.type = type;
+            this.distance = distance;
+            this.instruction = instruction;
+        }
+    }
+
+    static class RouteResult {
+        ArrayList<LatLon> points;
+        ArrayList<Maneuver> maneuvers;
+        RouteResult(ArrayList<LatLon> points, ArrayList<Maneuver> maneuvers) {
+            this.points = points;
+            this.maneuvers = maneuvers;
+        }
     }
 }
