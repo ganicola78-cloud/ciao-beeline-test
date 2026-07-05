@@ -156,7 +156,7 @@ public class NavView extends View {
         drawSideRoads(c, screenPts);
         drawRoutePath(c, screenPts);
         drawRoundaboutHint(c);
-        drawTriangle(c, 120, 140, 16);
+        drawTriangleAlignedToRoute(c, screenPts, 120, 140, 16);
         drawBottom(c);
         drawSpeedLimit(c);
 
@@ -302,6 +302,50 @@ public class NavView extends View {
         textPaint.setColor(Color.WHITE);
     }
 
+
+    private void drawTriangleAlignedToRoute(Canvas c, ArrayList<PointF> pts, float cx, float cy, float halfWidth) {
+        float angle = routeStartAngleDegrees(pts, cx, cy);
+
+        c.save();
+        c.rotate(angle, cx, cy);
+        drawTriangle(c, cx, cy, halfWidth);
+        c.restore();
+    }
+
+    private float routeStartAngleDegrees(ArrayList<PointF> pts, float cx, float cy) {
+        if (pts == null || pts.size() < 2) {
+            return 0f;
+        }
+
+        PointF best = null;
+        float bestDist = Float.MAX_VALUE;
+
+        for (PointF p : pts) {
+            float dx = p.x - cx;
+            float dy = p.y - cy;
+            float d = (float) Math.sqrt(dx * dx + dy * dy);
+
+            if (d > 8f && d < bestDist) {
+                best = p;
+                bestDist = d;
+            }
+        }
+
+        if (best == null) {
+            best = pts.get(Math.min(1, pts.size() - 1));
+        }
+
+        float dx = best.x - cx;
+        float dy = best.y - cy;
+
+        if (Math.abs(dx) < 1f && Math.abs(dy) < 1f) {
+            return 0f;
+        }
+
+        // La freccia base punta verso l'alto. Con atan2(dx, -dy) otteniamo
+        // la rotazione necessaria per allinearla al primo tratto della rotta.
+        return (float) Math.toDegrees(Math.atan2(dx, -dy));
+    }
 
     private void drawTriangle(Canvas c, float cx, float cy, float halfWidth) {
         float height = 28f;
