@@ -33,6 +33,13 @@ public class NavView extends View {
     // Linea demo/default
     private String line = "120,200;120,165;145,140;145,95;105,60";
 
+    // V0.15: valori visualizzati con animazione fluida.
+    private final ArrayList<PointF> targetPts = new ArrayList<>();
+    private final ArrayList<PointF> displayPts = new ArrayList<>();
+    private float displayDist = dist;
+    private float displaySpeed = speed;
+    private boolean animating = false;
+
     public NavView(Context c) {
         super(c);
 
@@ -72,16 +79,132 @@ public class NavView extends View {
     public void update(String json) {
         try {
             JSONObject o = new JSONObject(json);
+
             mode = o.optString("mode", mode);
             turn = o.optString("turn", turn);
-            dist = o.optInt("dist", dist);
-            speed = o.optInt("speed", speed);
+
+            int newDist = o.optInt("dist", dist);
+            int newSpeed = o.optInt("speed", speed);
+
+            dist = newDist;
+            speed = newSpeed;
             limit = o.optInt("limit", limit);
-            line = o.optString("line", line);
-            postInvalidate();
+
+            String newLine = o.optString("line", line);
+
+            if (!newLine.equals(line)) {
+                line = newLine;
+                ArrayList<PointF> parsed = parseLine(line);
+
+                if (!parsed.isEmpty()) {
+                    targetPts.clear();
+                    targetPts.addAll(parsed);
+
+                    if (displayPts.isEmpty()) {
+                        displayPts.addAll(copyPoints(targetPts));
+                    } else {
+                        adaptDisplayPointCount();
+                    }
+                }
+            }
+
+            startSmoothAnimation();
         } catch (Exception ignored) {
         }
     }
+
+    private void startSmoothAnimation() {
+        if (animating) return;
+
+        animating = true;
+        post(smoothRunnable);
+    }
+
+    private final Runnable smoothRunnable = new Runnable() {
+        @Override
+        public void run() {
+            boolean keepGoing = false;
+
+            if (!targetPts.isEmpty()) {
+                if (displayPts.isEmpty()) {
+                    displayPts.addAll(copyPoints(targetPts));
+                }
+
+                adaptDisplayPointCount();
+
+                for (int i = 0; i < displayPts.size() && i < targetPts.size(); i++) {
+                    PointF d = displayPts.get(i);
+                    PointF t = targetPts.get(i);
+
+                    float dx = t.x - d.x;
+                    float dy = t.y - d.y;
+
+                    d.x += dx * 0.28f;
+                    d.y += dy * 0.28f;
+
+                    if (Math.abs(dx) > 0.8f || Math.abs(dy) > 0.8f) {
+                        keepGoing = true;
+                    }
+                }
+            }
+
+            float distDelta = dist - displayDist;
+            float speedDelta = speed - displaySpeed;
+
+            displayDist += distDelta * 0.30f;
+            displaySpeed += speedDelta * 0.35f;
+
+            if (Math.abs(distDelta) > 1.0f || Math.abs(speedDelta) > 0.5f) {
+                keepGoing = true;
+            }
+
+            postInvalidate();
+
+            if (keepGoing) {
+                postDelayed(this, 50);
+            } else {
+                displayDist = dist;
+                displaySpeed = speed;
+
+                if (!targetPts.isEmpty()) {
+                    displayPts.clear();
+                    displayPts.addAll(copyPoints(targetPts));
+                }
+
+                animating = false;
+                postInvalidate();
+            }
+        }
+    };
+
+    private void adaptDisplayPointCount() {
+        if (targetPts.isEmpty()) return;
+
+        if (displayPts.isEmpty()) {
+            displayPts.addAll(copyPoints(targetPts));
+            return;
+        }
+
+        while (displayPts.size() < targetPts.size()) {
+            PointF last = displayPts.get(displayPts.size() - 1);
+            displayPts.add(new PointF(last.x, last.y));
+        }
+
+        while (displayPts.size() > targetPts.size()) {
+            displayPts.remove(displayPts.size() - 1);
+        }
+    }
+
+    private ArrayList<PointF> copyPoints(ArrayList<PointF> src) {
+        ArrayList<PointF> out = new ArrayList<>();
+
+        for (PointF p : src) {
+            out.add(new PointF(p.x, p.y));
+        }
+
+        return out;
+    }
+
 
     @Override
     protected void onDraw(Canvas c) {
@@ -145,7 +268,7 @@ public class NavView extends View {
         c.drawText("↖", 120, 153, textPaint);
 
         textPaint.setTextSize(22);
-        c.drawText(dist + " m", 120, 190, textPaint);
+        c.drawText(formatDistance(Math.round(displayDist)), 120, 190, textPaint);
     }
 
     private void drawNav(Canvas c) {
@@ -246,12 +369,22 @@ public class NavView extends View {
     }
 
     private ArrayList<PointF> transformedLine(RectF box) {
-        ArrayList<PointF> pts = parseLine(line);
+        ArrayList<PointF> pts;
+
+        if (!displayPts.isEmpty()) {
+            pts = copyPoints(displayPts);
+        } else {
+            pts = parseLine(line);
+            if (!pts.isEmpty() && targetPts.isEmpty()) {
+                targetPts.addAll(copyPoints(pts));
+                displayPts.addAll(copyPoints(pts));
+            }
+        }
+
         ArrayList<PointF> out = new ArrayList<>();
 
-        // V0.12: la mappa viene ruotata intorno alla freccia.
-        // Il primo tratto della strada davanti viene sempre portato in verticale,
-        // così la rotta sembra "frontale" come su Beeline.
+        // V0.15: rotta frontale + transizione morbida.
+        // La linea viene animata sul Carlyle invece di saltare di colpo.
         float cx = 120f;
         float cy = 140f;
         float angle = routeStartAngleDegrees(pts, cx, cy);
@@ -280,17 +413,22 @@ public class NavView extends View {
     private void drawRoundaboutHint(Canvas c) {
         if (!"ROUND".equals(turn)) return;
 
+        // V0.13: la rotonda non viene più disegnata come strada finta al centro,
+        // perché risultava imprecisa. Mostriamo un piccolo segnale rotonda vicino
+        // alle indicazioni, mentre la linea bianca resta la rotta reale.
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(7f);
+        p.setStrokeWidth(4f);
         p.setStrokeCap(Paint.Cap.ROUND);
         p.setColor(Color.WHITE);
 
-        RectF r = new RectF(93, 50, 147, 104);
-        c.drawArc(r, 35, 300, false, p);
+        RectF r = new RectF(34, 160, 58, 184);
+        c.drawArc(r, 40, 300, false, p);
 
-        // Piccola uscita verso l'alto/destra per rendere visibile la rotatoria.
-        c.drawLine(138, 60, 166, 42, p);
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextSize(14f);
+        textPaint.setColor(Color.WHITE);
+        c.drawText("↻", 46, 177, textPaint);
     }
 
     private void drawSpeedLimit(Canvas c) {
@@ -382,11 +520,11 @@ public class NavView extends View {
 
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         textPaint.setTextSize(24);
-        c.drawText(turnSymbol(turn) + " " + formatDistance(dist), 120, distY, textPaint);
+        c.drawText(turnSymbol(turn) + " " + formatDistance(Math.round(displayDist)), 120, distY, textPaint);
 
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         textPaint.setTextSize(22);
-        c.drawText(speed + " km/h", 120, speedY, textPaint);
+        c.drawText(Math.round(displaySpeed) + " km/h", 120, speedY, textPaint);
     }
 
     private String formatDistance(int meters) {
