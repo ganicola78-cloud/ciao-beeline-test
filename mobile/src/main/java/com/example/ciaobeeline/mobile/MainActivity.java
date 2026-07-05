@@ -6,6 +6,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.net.Uri;
+import android.provider.Settings;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
@@ -62,6 +65,10 @@ public class MainActivity extends Activity {
         test.setText("INVIA DEMO AL CARLYLE");
         root.addView(test);
 
+        Button battery = new Button(this);
+        battery.setText("DISATTIVA RISPARMIO BATTERIA");
+        root.addView(battery);
+
         status = new TextView(this);
         status.setText("Pronto. La navigazione continuerà anche a schermo spento con notifica attiva.");
         status.setTextSize(16);
@@ -74,9 +81,43 @@ public class MainActivity extends Activity {
         start.setOnClickListener(v -> startRoutingService());
         stop.setOnClickListener(v -> stopRoutingService());
         test.setOnClickListener(v -> sendDemo());
+        battery.setOnClickListener(v -> openBatteryOptimizationSettings());
 
+        requestNeededPermissions();
+    }
+
+    private void requestNeededPermissions() {
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 5);
+            return;
+        }
+
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 6);
+        }
+    }
+
+    private void openBatteryOptimizationSettings() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                i.setData(Uri.parse("package:" + getPackageName()));
+                startActivity(i);
+                status.setText("Conferma di non ottimizzare la batteria per Ciao Beeline.");
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            Intent i = new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+            startActivity(i);
+            status.setText("Imposta Ciao Beeline su batteria senza restrizioni.");
+        } catch (Exception e) {
+            status.setText("Apri manualmente Impostazioni > App > Ciao Beeline > Batteria > Nessuna restrizione.");
         }
     }
 
@@ -111,6 +152,11 @@ public class MainActivity extends Activity {
             status.setText("Concedi il permesso posizione.");
             requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 5);
             return;
+        }
+
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 6);
         }
 
         Intent i = new Intent(this, NavigationService.class);
@@ -153,5 +199,4 @@ public class MainActivity extends Activity {
             }
         });
     }
-    }
-    
+}
