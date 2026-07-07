@@ -25,10 +25,17 @@ public class MainActivity extends Activity {
     private static final String PREFS = "ciao_beeline_prefs";
     private static final String PREF_API_KEY = "ors_api_key";
     private static final String PREF_DESTINATION = "destination_text";
+    private static final String PREF_ROUTE_MODE = "route_mode";
+    private static final String PREF_ALLOW_FAST_ROADS = "allow_fast_roads";
 
     private EditText apiKeyEdit;
     private EditText destinationEdit;
     private TextView status;
+    private Button fastestButton;
+    private Button shortestButton;
+    private Button fastRoadsButton;
+    private String routeMode = "fastest";
+    private boolean allowFastRoads = false;
 
     @Override
     public void onCreate(Bundle b) {
@@ -52,6 +59,18 @@ public class MainActivity extends Activity {
         destinationEdit = new EditText(this);
         destinationEdit.setHint("Destinazione, es. Via Roma, Cagliari");
         root.addView(destinationEdit);
+
+        fastestButton = new Button(this);
+        fastestButton.setText("TRAGITTO: PIÙ VELOCE");
+        root.addView(fastestButton);
+
+        shortestButton = new Button(this);
+        shortestButton.setText("TRAGITTO: PIÙ BREVE");
+        root.addView(shortestButton);
+
+        fastRoadsButton = new Button(this);
+        fastRoadsButton.setText("AUTOSTRADE / SUPERSTRADE");
+        root.addView(fastRoadsButton);
 
         Button start = new Button(this);
         start.setText("START LIVE ROUTING");
@@ -77,6 +96,25 @@ public class MainActivity extends Activity {
         setContentView(root);
 
         loadPrefs();
+        updateRouteModeButtons();
+
+        fastestButton.setOnClickListener(v -> {
+            routeMode = "fastest";
+            savePrefs();
+            updateRouteModeButtons();
+        });
+
+        shortestButton.setOnClickListener(v -> {
+            routeMode = "shortest";
+            savePrefs();
+            updateRouteModeButtons();
+        });
+
+        fastRoadsButton.setOnClickListener(v -> {
+            allowFastRoads = !allowFastRoads;
+            savePrefs();
+            updateRouteModeButtons();
+        });
 
         start.setOnClickListener(v -> startRoutingService());
         stop.setOnClickListener(v -> stopRoutingService());
@@ -125,6 +163,8 @@ public class MainActivity extends Activity {
         SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
         apiKeyEdit.setText(p.getString(PREF_API_KEY, ""));
         destinationEdit.setText(p.getString(PREF_DESTINATION, ""));
+        routeMode = p.getString(PREF_ROUTE_MODE, "fastest");
+        allowFastRoads = p.getBoolean(PREF_ALLOW_FAST_ROADS, false);
     }
 
     private void savePrefs() {
@@ -132,7 +172,32 @@ public class MainActivity extends Activity {
                 .edit()
                 .putString(PREF_API_KEY, apiKeyEdit.getText().toString().trim())
                 .putString(PREF_DESTINATION, destinationEdit.getText().toString().trim())
+                .putString(PREF_ROUTE_MODE, routeMode)
+                .putBoolean(PREF_ALLOW_FAST_ROADS, allowFastRoads)
                 .apply();
+    }
+
+    private void updateRouteModeButtons() {
+        String modeText;
+
+        if ("shortest".equals(routeMode)) {
+            fastestButton.setText("PIÙ VELOCE");
+            shortestButton.setText("✓ PIÙ BREVE");
+            modeText = "più breve";
+        } else {
+            routeMode = "fastest";
+            fastestButton.setText("✓ PIÙ VELOCE");
+            shortestButton.setText("PIÙ BREVE");
+            modeText = "più veloce";
+        }
+
+        if (allowFastRoads) {
+            fastRoadsButton.setText("✓ AUTOSTRADE / SUPERSTRADE: SÌ");
+            status.setText("Modalità percorso: " + modeText + " con autostrade/superstrade consentite.");
+        } else {
+            fastRoadsButton.setText("AUTOSTRADE / SUPERSTRADE: NO");
+            status.setText("Modalità percorso: " + modeText + " senza autostrade/superstrade.");
+        }
     }
 
     private void startRoutingService() {
