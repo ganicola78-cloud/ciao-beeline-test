@@ -17,6 +17,7 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import com.google.android.gms.wearable.Node;
@@ -69,9 +70,16 @@ public class MainActivity extends Activity {
         Configuration.getInstance().load(getApplicationContext(), getSharedPreferences("osmdroid", MODE_PRIVATE));
         Configuration.getInstance().setUserAgentValue(getPackageName());
 
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(false);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 24, 24, 24);
+        scroll.addView(root, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
 
         TextView title = new TextView(this);
         title.setText("Ciao Beeline Test - Phone");
@@ -130,10 +138,10 @@ public class MainActivity extends Activity {
         routeMap.getController().setCenter(new GeoPoint(41.9028, 12.4964));
         root.addView(routeMap, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                650
+                1000
         ));
 
-        setContentView(root);
+        setContentView(scroll);
 
         loadPrefs();
         updateRouteModeButtons();
