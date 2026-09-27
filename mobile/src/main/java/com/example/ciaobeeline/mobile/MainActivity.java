@@ -36,12 +36,14 @@ import java.util.ArrayList;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.osmdroid.config.Configuration;
+import org.osmdroid.events.MapEventsReceiver;
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase;
 import org.osmdroid.tileprovider.tilesource.TileSourcePolicy;
 import org.osmdroid.tileprovider.tilesource.XYTileSource;
 import org.osmdroid.util.BoundingBox;
 import org.osmdroid.util.GeoPoint;
 import org.osmdroid.views.MapView;
+import org.osmdroid.views.overlay.MapEventsOverlay;
 import org.osmdroid.views.overlay.Marker;
 import org.osmdroid.views.overlay.Polyline;
 
@@ -80,6 +82,8 @@ public class MainActivity extends Activity {
     private String routeMode = "fastest";
     private boolean allowFastRoads = false;
     private MapView routeMap;
+    private MapEventsOverlay mapEventsOverlay;
+    private final ArrayList<GeoPoint> selectedRoutePoints = new ArrayList<>();
 
     @Override
     public void onCreate(Bundle b) {
@@ -172,6 +176,22 @@ public class MainActivity extends Activity {
             }
             return false;
         });
+
+        // Pressione lunga sulla mappa:
+        // 1° punto = partenza, ultimo = arrivo, quelli in mezzo = waypoint.
+        mapEventsOverlay = new MapEventsOverlay(new MapEventsReceiver() {
+            @Override
+            public boolean singleTapConfirmedHelper(GeoPoint p) {
+                return false;
+            }
+
+            @Override
+            public boolean longPressHelper(GeoPoint p) {
+                addSelectedRoutePoint(p);
+                return true;
+            }
+        });
+        routeMap.getOverlays().add(mapEventsOverlay);
 
         routeMap.getController().setZoom(13.0);
         routeMap.getController().setCenter(new GeoPoint(41.9028, 12.4964));
@@ -292,15 +312,30 @@ public class MainActivity extends Activity {
         savePrefs();
 
         String key = apiKeyEdit.getText().toString().trim();
-        String destText = destinationEdit.getText().toString().trim();
 
         if (key.length() < 8) {
             status.setText("Inserisci API key OpenRouteService.");
             return;
         }
 
+        // Se sono stati scelti punti sulla mappa, usa quelli:
+        // primo = partenza, ultimo = arrivo, intermedi = waypoint.
+        if (!selectedRoutePoints.isEmpty()) {
+            if (selectedRoutePoints.size() < 2) {
+                status.setText("Hai selezionato la partenza. Tieni premuto su almeno un secondo punto per impostare l'arrivo.");
+                return;
+            }
+
+            fetchAndDrawPreviewFromSelectedPoints(key);
+            return;
+        }
+
+        // Nessun punto selezionato: mantiene il funzionamento precedente
+        // GPS attuale + destinazione scritta nel campo.
+        String destText = destinationEdit.getText().toString().trim();
+
         if (destText.length() < 3) {
-            status.setText("Inserisci una destinazione.");
+            status.setText("Inserisci una destinazione oppure seleziona almeno 2 punti sulla mappa con una pressione lunga.");
             return;
         }
 
@@ -340,6 +375,72 @@ public class MainActivity extends Activity {
         } catch (SecurityException e) {
             status.setText("Permesso posizione mancante.");
         }
+    }
+
+    private void addSelectedRoutePoint(GeoPoint p) {
+        GeoPoint point = new GeoPoint(p.getLatitude(), p.getLongitude());
+        selectedRoutePoints.add(point);
+
+        redrawSelectedRoutePoints();
+
+        int count = selectedRoutePoints.size();
+        if (count == 1) {
+            status.setText("Partenza selezionata. Tieni premuto su un altro punto per impostare l'arrivo.");
+        } else if (count == 2) {
+            status.setText("Partenza e arrivo selezionati. Puoi aggiungere altri punti tenendo premuto, poi premi VEDI TRAGITTO SU MAPPA.");
+        } else {
+            int waypointCount = count - 2;
+            status.setText(count + " punti selezionati: " + waypointCount +
+                    (waypointCount == 1 ? " waypoint. " : " waypoint. ") +
+                    "Premi VEDI TRAGITTO SU MAPPA per calcolare il percorso.");
+        }
+    }
+
+    private void redrawSelectedRoutePoints() {
+        routeMap.getOverlays().clear();
+
+        if (mapEventsOverlay != null) {
+            routeMap.getOverlays().add(mapEventsOverlay);
+        }
+
+        addSelectedPointMarkers();
+        routeMap.invalidate();
+    }
+
+    private void addSelectedPointMarkers() {
+        for (int i = 0; i < selectedRoutePoints.size(); i++) {
+            Marker marker = new Marker(routeMap);
+            marker.setPosition(selectedRoutePoints.get(i));
+            marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM);
+
+            if (i == 0) {
+                marker.setTitle("1 - Partenza");
+            } else if (i == selectedRoutePoints.size() - 1) {
+                marker.setTitle((i + 1) + " - Arrivo");
+            } else {
+                marker.setTitle((i + 1) + " - Waypoint");
+            }
+
+            routeMap.getOverlays().add(marker);
+        }
+    }
+
+    private void fetchAndDrawPreviewFromSelectedPoints(String key) {
+        status.setText("Calcolo percorso attraverso i punti selezionati...");
+
+        final ArrayList<GeoPoint> pointsCopy = new ArrayList<>();
+        for (GeoPoint p : selectedRoutePoints) {
+            pointsCopy.add(new GeoPoint(p.getLatitude(), p.getLongitude()));
+        }
+
+        new Thread(() -> {
+            try {
+                PreviewRoute previewRoute = previewRequestDirections(key, pointsCopy);
+                runOnUiThread(() -> drawSelectedPreviewRoute(previewRoute, pointsCopy));
+            } catch (Exception e) {
+                runOnUiThread(() -> status.setText("Errore anteprima: " + e.getMessage()));
+            }
+        }).start();
     }
 
     private Location bestLastLocation(LocationManager lm) {
@@ -445,6 +546,100 @@ public class MainActivity extends Activity {
         return new PreviewRoute(points, distance, duration);
     }
 
+    private PreviewRoute previewRequestDirections(String key, ArrayList<GeoPoint> selectedPoints) throws Exception {
+        URL url = new URL("https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson");
+
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Authorization", key);
+        c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+
+        String preference = "shortest".equals(routeMode) ? "shortest" : "fastest";
+
+        StringBuilder body = new StringBuilder();
+        body.append("{\"coordinates\":[");
+
+        for (int i = 0; i < selectedPoints.size(); i++) {
+            if (i > 0) body.append(",");
+            GeoPoint p = selectedPoints.get(i);
+            body.append("[")
+                    .append(p.getLongitude())
+                    .append(",")
+                    .append(p.getLatitude())
+                    .append("]");
+        }
+
+        body.append("],\"preference\":\"")
+                .append(preference)
+                .append("\"");
+
+        if (!allowFastRoads) {
+            body.append(",\"options\":{\"avoid_features\":[\"highways\",\"tollways\"]}");
+        }
+
+        body.append("}");
+
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+        }
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+
+        if (c.getResponseCode() >= 400) throw new RuntimeException(txt);
+
+        JSONObject json = new JSONObject(txt);
+        JSONObject feature = json.getJSONArray("features").getJSONObject(0);
+        JSONArray coords = feature.getJSONObject("geometry").getJSONArray("coordinates");
+
+        ArrayList<GeoPoint> points = new ArrayList<>();
+        for (int i = 0; i < coords.length(); i++) {
+            JSONArray p = coords.getJSONArray(i);
+            points.add(new GeoPoint(p.getDouble(1), p.getDouble(0)));
+        }
+
+        JSONObject summary = feature.getJSONObject("properties").optJSONObject("summary");
+        double distance = summary != null ? summary.optDouble("distance", 0) : 0;
+        double duration = summary != null ? summary.optDouble("duration", 0) : 0;
+
+        return new PreviewRoute(points, distance, duration);
+    }
+
+    private void drawSelectedPreviewRoute(PreviewRoute previewRoute, ArrayList<GeoPoint> selectedPoints) {
+        if (previewRoute.points.isEmpty()) {
+            status.setText("Nessun punto percorso trovato.");
+            return;
+        }
+
+        routeMap.getOverlays().clear();
+
+        if (mapEventsOverlay != null) {
+            routeMap.getOverlays().add(mapEventsOverlay);
+        }
+
+        Polyline line = new Polyline();
+        line.setPoints(previewRoute.points);
+        line.setWidth(8f);
+        line.setColor(0xff1976d2);
+        routeMap.getOverlays().add(line);
+
+        // Ridisegna partenza, waypoint e arrivo sopra la linea.
+        addSelectedPointMarkers();
+
+        zoomMapTo(previewRoute.points);
+        routeMap.invalidate();
+
+        String modeText = "shortest".equals(routeMode) ? "più breve" : "più veloce";
+        String roadText = allowFastRoads ? "con autostrade/superstrade" : "senza autostrade/superstrade";
+        int waypointCount = Math.max(0, selectedPoints.size() - 2);
+
+        status.setText("Anteprima: " + modeText + " " + roadText + " - " +
+                waypointCount + (waypointCount == 1 ? " waypoint - " : " waypoint - ") +
+                formatPreviewDistance(previewRoute.distanceMeters) + " - " +
+                formatPreviewDuration(previewRoute.durationSeconds));
+    }
+
     private void drawPreviewRoute(PreviewRoute previewRoute, Location startLocation, LatLon dest) {
         if (previewRoute.points.isEmpty()) {
             status.setText("Nessun punto percorso trovato.");
@@ -452,6 +647,10 @@ public class MainActivity extends Activity {
         }
 
         routeMap.getOverlays().clear();
+
+        if (mapEventsOverlay != null) {
+            routeMap.getOverlays().add(mapEventsOverlay);
+        }
 
         Polyline line = new Polyline();
         line.setPoints(previewRoute.points);
