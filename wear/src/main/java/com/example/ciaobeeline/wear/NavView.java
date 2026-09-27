@@ -16,34 +16,33 @@ import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * Clean-room "Beeline-style" renderer for the Fossil Carlyle.
+ * Ciao Beeline - round navigation renderer for the Fossil Carlyle.
  *
- * Keeps the existing /nav_update JSON protocol used by Ciao Beeline:
+ * Clean-room UI designed for quick readability on a 240x240 round display.
+ * It keeps the existing phone -> watch JSON protocol unchanged:
  *   mode, turn, dist, speed, limit, line
  *
  * Optional forward-compatible fields:
  *   progress : 0.0 .. 1.0
  *   exit     : roundabout exit number
- *   roads    : one or more grey road polylines:
- *              "x,y;x,y;x,y|x,y;x,y"
- *
- * Logical canvas is 240 x 240 and automatically scales to the watch panel.
+ *   roads    : grey context polylines, e.g. "x,y;x,y|x,y;x,y"
  */
 public class NavView extends View {
 
     private static final float W = 240f;
     private static final float H = 240f;
+
+    // Rider marker is intentionally low: the road grows upward in heading-up view.
     private static final float MARKER_X = 120f;
-    private static final float MARKER_Y = 140f;
+    private static final float MARKER_Y = 164f;
 
     private final Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint routeUnderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint routeShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint routePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint roadPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint markerFill = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint markerStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mutedTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint thinLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint progressTrackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint progressPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
@@ -55,26 +54,29 @@ public class NavView extends View {
     private int roundaboutExit = -1;
     private float progress = -1f;
 
-    private String line = "120,140;120,118;142,99;142,72;112,43";
+    // Logical 240x240 route coordinates coming from the phone.
+    private String line = "120,164;120,146;120,126;137,108;153,93;157,69";
     private String roads = "";
 
     private final ArrayList<PointF> targetPts = new ArrayList<>();
     private final ArrayList<PointF> displayPts = new ArrayList<>();
     private float displayDist = dist;
+    private float displaySpeed = speed;
     private boolean animating = false;
 
-    public NavView(Context c) {
-        super(c);
+    public NavView(Context context) {
+        super(context);
         setKeepScreenOn(true);
+        setLayerType(View.LAYER_TYPE_SOFTWARE, null);
 
         bgPaint.setStyle(Paint.Style.FILL);
         bgPaint.setColor(Color.BLACK);
 
-        routeUnderPaint.setStyle(Paint.Style.STROKE);
-        routeUnderPaint.setColor(Color.rgb(25, 25, 25));
-        routeUnderPaint.setStrokeWidth(15f);
-        routeUnderPaint.setStrokeCap(Paint.Cap.ROUND);
-        routeUnderPaint.setStrokeJoin(Paint.Join.ROUND);
+        routeShadowPaint.setStyle(Paint.Style.STROKE);
+        routeShadowPaint.setColor(Color.rgb(24, 24, 24));
+        routeShadowPaint.setStrokeWidth(17f);
+        routeShadowPaint.setStrokeCap(Paint.Cap.ROUND);
+        routeShadowPaint.setStrokeJoin(Paint.Join.ROUND);
 
         routePaint.setStyle(Paint.Style.STROKE);
         routePaint.setColor(Color.WHITE);
@@ -83,34 +85,30 @@ public class NavView extends View {
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
         roadPaint.setStyle(Paint.Style.STROKE);
-        roadPaint.setColor(Color.rgb(88, 88, 88));
-        roadPaint.setStrokeWidth(3.2f);
+        roadPaint.setColor(Color.rgb(68, 68, 68));
+        roadPaint.setStrokeWidth(3.6f);
         roadPaint.setStrokeCap(Paint.Cap.ROUND);
         roadPaint.setStrokeJoin(Paint.Join.ROUND);
-
-        markerFill.setStyle(Paint.Style.FILL);
-        markerFill.setColor(Color.WHITE);
-
-        markerStroke.setStyle(Paint.Style.STROKE);
-        markerStroke.setColor(Color.BLACK);
-        markerStroke.setStrokeWidth(3f);
-        markerStroke.setStrokeJoin(Paint.Join.ROUND);
 
         textPaint.setColor(Color.WHITE);
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
 
-        mutedTextPaint.setColor(Color.rgb(165, 165, 165));
+        mutedTextPaint.setColor(Color.rgb(150, 150, 150));
         mutedTextPaint.setTextAlign(Paint.Align.CENTER);
-        mutedTextPaint.setTypeface(Typeface.DEFAULT);
+        mutedTextPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.NORMAL));
+
+        thinLinePaint.setStyle(Paint.Style.STROKE);
+        thinLinePaint.setStrokeWidth(1.5f);
+        thinLinePaint.setColor(Color.rgb(54, 54, 54));
 
         progressTrackPaint.setStyle(Paint.Style.STROKE);
-        progressTrackPaint.setStrokeWidth(3.5f);
+        progressTrackPaint.setStrokeWidth(4f);
         progressTrackPaint.setStrokeCap(Paint.Cap.ROUND);
-        progressTrackPaint.setColor(Color.rgb(55, 55, 55));
+        progressTrackPaint.setColor(Color.rgb(48, 48, 48));
 
         progressPaint.setStyle(Paint.Style.STROKE);
-        progressPaint.setStrokeWidth(3.5f);
+        progressPaint.setStrokeWidth(4f);
         progressPaint.setStrokeCap(Paint.Cap.ROUND);
         progressPaint.setColor(Color.WHITE);
 
@@ -132,7 +130,7 @@ public class NavView extends View {
 
             if (o.has("progress")) {
                 progress = (float) o.optDouble("progress", progress);
-                if (progress >= 0f) progress = Math.max(0f, Math.min(1f, progress));
+                if (progress >= 0f) progress = clamp(progress, 0f, 1f);
             }
 
             roads = o.optString("roads", roads);
@@ -155,6 +153,7 @@ public class NavView extends View {
 
             startSmoothAnimation();
         } catch (Exception ignored) {
+            // Keep the last valid navigation state on malformed packets.
         }
     }
 
@@ -180,25 +179,30 @@ public class NavView extends View {
                     float dx = t.x - d.x;
                     float dy = t.y - d.y;
 
-                    d.x += dx * 0.24f;
-                    d.y += dy * 0.24f;
+                    d.x += dx * 0.22f;
+                    d.y += dy * 0.22f;
 
-                    if (Math.abs(dx) > 0.45f || Math.abs(dy) > 0.45f) {
+                    if (Math.abs(dx) > 0.35f || Math.abs(dy) > 0.35f) {
                         keepGoing = true;
                     }
                 }
             }
 
             float dd = dist - displayDist;
-            displayDist += dd * 0.30f;
-            if (Math.abs(dd) > 0.75f) keepGoing = true;
+            displayDist += dd * 0.28f;
+            if (Math.abs(dd) > 0.6f) keepGoing = true;
+
+            float ds = speed - displaySpeed;
+            displaySpeed += ds * 0.30f;
+            if (Math.abs(ds) > 0.4f) keepGoing = true;
 
             postInvalidate();
 
             if (keepGoing) {
-                postDelayed(this, 40);
+                postDelayed(this, 35);
             } else {
                 displayDist = dist;
+                displaySpeed = speed;
                 displayPts.clear();
                 displayPts.addAll(copyPoints(targetPts));
                 animating = false;
@@ -226,39 +230,40 @@ public class NavView extends View {
     }
 
     @Override
-    protected void onDraw(Canvas c) {
-        super.onDraw(c);
+    protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
 
-        int w = getWidth();
-        int h = getHeight();
-        float scale = Math.min(w, h) / W;
+        int width = getWidth();
+        int height = getHeight();
+        float scale = Math.min(width, height) / W;
 
-        c.save();
-        c.scale(scale, scale);
-        c.translate((w / scale - W) / 2f, (h / scale - H) / 2f);
+        canvas.save();
+        canvas.scale(scale, scale);
+        canvas.translate((width / scale - W) / 2f, (height / scale - H) / 2f);
 
-        c.drawCircle(W / 2f, H / 2f, 120f, bgPaint);
+        canvas.drawCircle(120f, 120f, 120f, bgPaint);
 
         Path clip = new Path();
         clip.addCircle(120f, 120f, 118.5f, Path.Direction.CW);
-        c.save();
-        c.clipPath(clip);
+        canvas.save();
+        canvas.clipPath(clip);
 
         if ("WAIT".equals(mode)) {
-            drawWait(c);
+            drawWait(canvas);
         } else if ("STOP".equals(mode)) {
-            drawStop(c);
+            drawStop(canvas);
         } else if ("OFF_ROUTE".equals(mode)) {
-            drawOffRoute(c);
+            drawOffRoute(canvas);
         } else {
-            drawNavigation(c);
+            drawNavigation(canvas);
         }
 
-        c.restore();
-        c.restore();
+        canvas.restore();
+        canvas.restore();
     }
 
     private void drawNavigation(Canvas c) {
+        // Main navigation field first; UI is layered above it.
         drawContextRoads(c);
 
         ArrayList<PointF> pts = displayPts.isEmpty()
@@ -268,20 +273,20 @@ public class NavView extends View {
         drawRoute(c, pts);
         drawPositionMarker(c);
 
+        drawTopGuidance(c);
+        drawBottomStatus(c);
+        drawProgress(c);
+
         if ("REROUTE".equals(mode)) {
             drawRerouteBadge(c);
         }
-
-        drawSpeedLimit(c);
-        drawBottomGuidance(c);
-        drawProgress(c);
     }
 
     private void drawRoute(Canvas c, ArrayList<PointF> pts) {
         if (pts.size() < 2) return;
 
         Path p = smoothPath(pts);
-        c.drawPath(p, routeUnderPaint);
+        c.drawPath(p, routeShadowPaint);
         c.drawPath(p, routePaint);
     }
 
@@ -317,209 +322,329 @@ public class NavView extends View {
             ArrayList<PointF> pts = normalizedContext(parseLine(polyline));
             if (pts.size() < 2) continue;
 
-            Path p = new Path();
-            p.moveTo(pts.get(0).x, pts.get(0).y);
-            for (int i = 1; i < pts.size(); i++) {
-                p.lineTo(pts.get(i).x, pts.get(i).y);
-            }
+            Path p = smoothPath(pts);
             c.drawPath(p, roadPaint);
         }
     }
 
+    /**
+     * Rider marker: fixed low on the display. The route itself moves/changes around it.
+     * The white wedge is deliberately simple so it remains readable in sunlight.
+     */
     private void drawPositionMarker(Canvas c) {
-        // Beeline-style heading-up marker: the route rotates, marker stays fixed.
-        Path arrow = new Path();
-        arrow.moveTo(MARKER_X, MARKER_Y - 13f);
-        arrow.lineTo(MARKER_X - 9.5f, MARKER_Y + 10f);
-        arrow.lineTo(MARKER_X, MARKER_Y + 6f);
-        arrow.lineTo(MARKER_X + 9.5f, MARKER_Y + 10f);
-        arrow.close();
+        Paint halo = new Paint(Paint.ANTI_ALIAS_FLAG);
+        halo.setStyle(Paint.Style.FILL);
+        halo.setColor(Color.BLACK);
+        c.drawCircle(MARKER_X, MARKER_Y, 13.5f, halo);
 
-        c.drawPath(arrow, markerFill);
-        c.drawPath(arrow, markerStroke);
+        Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        ring.setStyle(Paint.Style.STROKE);
+        ring.setStrokeWidth(3.5f);
+        ring.setColor(Color.WHITE);
+        c.drawCircle(MARKER_X, MARKER_Y, 9.5f, ring);
+
+        Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fill.setStyle(Paint.Style.FILL);
+        fill.setColor(Color.WHITE);
+
+        Path wedge = new Path();
+        wedge.moveTo(MARKER_X, MARKER_Y - 15f);
+        wedge.lineTo(MARKER_X - 5.5f, MARKER_Y - 4.5f);
+        wedge.lineTo(MARKER_X + 5.5f, MARKER_Y - 4.5f);
+        wedge.close();
+        c.drawPath(wedge, fill);
+
+        Paint center = new Paint(Paint.ANTI_ALIAS_FLAG);
+        center.setColor(Color.BLACK);
+        center.setStyle(Paint.Style.FILL);
+        c.drawCircle(MARKER_X, MARKER_Y, 3.2f, center);
     }
 
-    private void drawBottomGuidance(Canvas c) {
-        // Next manoeuvre: bottom-left.
-        drawTurnIcon(c, 62f, 198f, turn);
+    private void drawTopGuidance(Canvas c) {
+        // Black translucent-looking plate made with opaque black, to keep route from crossing text.
+        Paint plate = new Paint(Paint.ANTI_ALIAS_FLAG);
+        plate.setStyle(Paint.Style.FILL);
+        plate.setColor(Color.BLACK);
+        RectF topPlate = new RectF(25f, 7f, 215f, 59f);
+        c.drawRoundRect(topPlate, 22f, 22f, plate);
 
-        // Distance: bottom-right.
+        drawTurnIcon(c, 52f, 34f, turn, 0.88f);
+
         textPaint.setTextAlign(Paint.Align.RIGHT);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(22f);
-        c.drawText(formatDistance(Math.round(displayDist)), 205f, 205f, textPaint);
+
+        String distanceText = formatDistance(Math.round(displayDist));
+        if (distanceText.endsWith(" m")) {
+            String number = distanceText.substring(0, distanceText.length() - 2);
+            textPaint.setTextSize(number.length() >= 4 ? 28f : 34f);
+            c.drawText(number, 181f, 43f, textPaint);
+
+            mutedTextPaint.setTextAlign(Paint.Align.LEFT);
+            mutedTextPaint.setTextSize(11f);
+            mutedTextPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+            c.drawText("m", 186f, 42f, mutedTextPaint);
+            mutedTextPaint.setTextAlign(Paint.Align.CENTER);
+        } else {
+            textPaint.setTextSize(distanceText.length() > 6 ? 24f : 28f);
+            c.drawText(distanceText, 204f, 43f, textPaint);
+        }
+
         textPaint.setTextAlign(Paint.Align.CENTER);
     }
 
-    private void drawTurnIcon(Canvas c, float cx, float cy, String t) {
+    private void drawBottomStatus(Canvas c) {
+        // A subtle separator helps the speed information stay readable over route geometry.
+        c.drawLine(57f, 197f, 183f, 197f, thinLinePaint);
+
+        // Current speed, left side.
+        int currentSpeed = Math.max(0, Math.round(displaySpeed));
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextSize(21f);
+        c.drawText(String.valueOf(currentSpeed), 78f, 220f, textPaint);
+
+        mutedTextPaint.setTextSize(7.5f);
+        mutedTextPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        c.drawText("km/h", 78f, 231f, mutedTextPaint);
+
+        // Tiny centre cue: useful when route geometry is nearly straight.
+        drawMiniDirectionCue(c, 120f, 218f, turn);
+
+        // Legal speed limit, right side. If unknown, keep the UI balanced with a dash.
+        if (limit > 0) {
+            drawSpeedLimit(c, 165f, 217f, 14.5f);
+        } else {
+            mutedTextPaint.setTextSize(17f);
+            c.drawText("—", 165f, 222f, mutedTextPaint);
+        }
+    }
+
+    private void drawMiniDirectionCue(Canvas c, float cx, float cy, String t) {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(Color.rgb(180, 180, 180));
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(2.3f);
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setStrokeJoin(Paint.Join.ROUND);
+
+        if ("ROUND".equals(t)) {
+            RectF r = new RectF(cx - 8f, cy - 8f, cx + 8f, cy + 8f);
+            c.drawArc(r, 40f, 270f, false, p);
+            return;
+        }
+
+        Path path = new Path();
+        if ("LEFT".equals(t)) {
+            path.moveTo(cx + 6f, cy + 7f);
+            path.lineTo(cx + 6f, cy - 3f);
+            path.lineTo(cx - 6f, cy - 3f);
+            c.drawPath(path, p);
+            drawArrowHead(c, cx - 6f, cy - 3f, 180f, p, 5f);
+        } else if ("RIGHT".equals(t)) {
+            path.moveTo(cx - 6f, cy + 7f);
+            path.lineTo(cx - 6f, cy - 3f);
+            path.lineTo(cx + 6f, cy - 3f);
+            c.drawPath(path, p);
+            drawArrowHead(c, cx + 6f, cy - 3f, 0f, p, 5f);
+        } else {
+            path.moveTo(cx, cy + 7f);
+            path.lineTo(cx, cy - 7f);
+            c.drawPath(path, p);
+            drawArrowHead(c, cx, cy - 7f, -90f, p, 5f);
+        }
+    }
+
+    private void drawTurnIcon(Canvas c, float cx, float cy, String t, float scale) {
         Paint ip = new Paint(Paint.ANTI_ALIAS_FLAG);
         ip.setColor(Color.WHITE);
         ip.setStyle(Paint.Style.STROKE);
-        ip.setStrokeWidth(5f);
+        ip.setStrokeWidth(4.5f * scale);
         ip.setStrokeCap(Paint.Cap.ROUND);
         ip.setStrokeJoin(Paint.Join.ROUND);
 
         if ("ROUND".equals(t)) {
-            RectF r = new RectF(cx - 14f, cy - 14f, cx + 14f, cy + 14f);
-            c.drawArc(r, 35f, 285f, false, ip);
+            float r = 13f * scale;
+            RectF rr = new RectF(cx - r, cy - r, cx + r, cy + r);
+            c.drawArc(rr, 35f, 285f, false, ip);
 
             Path head = new Path();
-            head.moveTo(cx + 13f, cy - 2f);
-            head.lineTo(cx + 16f, cy - 12f);
-            head.lineTo(cx + 6f, cy - 8f);
+            head.moveTo(cx + 12f * scale, cy - 1f * scale);
+            head.lineTo(cx + 15f * scale, cy - 11f * scale);
+            head.lineTo(cx + 5f * scale, cy - 8f * scale);
             c.drawPath(head, ip);
 
             if (roundaboutExit > 0) {
-                textPaint.setTextSize(11f);
+                textPaint.setTextSize(10f * scale);
                 textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-                c.drawText(String.valueOf(roundaboutExit), cx, cy + 4f, textPaint);
+                c.drawText(String.valueOf(roundaboutExit), cx, cy + 3.5f * scale, textPaint);
             }
             return;
         }
 
         Path p = new Path();
+        float span = 11f * scale;
+        float drop = 12f * scale;
 
         if ("LEFT".equals(t)) {
-            p.moveTo(cx + 10f, cy + 12f);
-            p.lineTo(cx + 10f, cy - 2f);
-            p.quadTo(cx + 10f, cy - 10f, cx + 2f, cy - 10f);
-            p.lineTo(cx - 10f, cy - 10f);
-
+            p.moveTo(cx + span, cy + drop);
+            p.lineTo(cx + span, cy - 2f * scale);
+            p.quadTo(cx + span, cy - 10f * scale, cx + 2f * scale, cy - 10f * scale);
+            p.lineTo(cx - span, cy - 10f * scale);
             c.drawPath(p, ip);
-            drawArrowHead(c, cx - 10f, cy - 10f, 180f, ip);
+            drawArrowHead(c, cx - span, cy - 10f * scale, 180f, ip, 7f * scale);
             return;
         }
 
         if ("RIGHT".equals(t)) {
-            p.moveTo(cx - 10f, cy + 12f);
-            p.lineTo(cx - 10f, cy - 2f);
-            p.quadTo(cx - 10f, cy - 10f, cx - 2f, cy - 10f);
-            p.lineTo(cx + 10f, cy - 10f);
-
+            p.moveTo(cx - span, cy + drop);
+            p.lineTo(cx - span, cy - 2f * scale);
+            p.quadTo(cx - span, cy - 10f * scale, cx - 2f * scale, cy - 10f * scale);
+            p.lineTo(cx + span, cy - 10f * scale);
             c.drawPath(p, ip);
-            drawArrowHead(c, cx + 10f, cy - 10f, 0f, ip);
+            drawArrowHead(c, cx + span, cy - 10f * scale, 0f, ip, 7f * scale);
             return;
         }
 
-        p.moveTo(cx, cy + 13f);
-        p.lineTo(cx, cy - 13f);
+        p.moveTo(cx, cy + 13f * scale);
+        p.lineTo(cx, cy - 13f * scale);
         c.drawPath(p, ip);
-        drawArrowHead(c, cx, cy - 13f, -90f, ip);
+        drawArrowHead(c, cx, cy - 13f * scale, -90f, ip, 7f * scale);
     }
 
-    private void drawArrowHead(Canvas c, float x, float y, float degrees, Paint p) {
+    private void drawArrowHead(Canvas c, float x, float y, float degrees, Paint p, float size) {
         double a = Math.toRadians(degrees);
         float ux = (float) Math.cos(a);
         float uy = (float) Math.sin(a);
         float px = -uy;
         float py = ux;
 
-        float backX = x - ux * 8f;
-        float backY = y - uy * 8f;
+        float backX = x - ux * size;
+        float backY = y - uy * size;
 
         Path head = new Path();
-        head.moveTo(backX + px * 5f, backY + py * 5f);
+        head.moveTo(backX + px * size * 0.62f, backY + py * size * 0.62f);
         head.lineTo(x, y);
-        head.lineTo(backX - px * 5f, backY - py * 5f);
+        head.lineTo(backX - px * size * 0.62f, backY - py * size * 0.62f);
         c.drawPath(head, p);
     }
 
     private void drawProgress(Canvas c) {
         if (progress < 0f) return;
 
-        float left = 66f;
-        float right = 174f;
-        float y = 224f;
-
-        c.drawLine(left, y, right, y, progressTrackPaint);
-        c.drawLine(left, y, left + (right - left) * progress, y, progressPaint);
+        RectF ring = new RectF(7f, 7f, 233f, 233f);
+        c.drawArc(ring, 205f, 130f, false, progressTrackPaint);
+        c.drawArc(ring, 205f, 130f * progress, false, progressPaint);
     }
 
-    private void drawSpeedLimit(Canvas c) {
+    private void drawSpeedLimit(Canvas c, float cx, float cy, float radius) {
         if (limit <= 0) return;
-
-        float cx = 192f;
-        float cy = 46f;
-        float r = 14f;
 
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setStyle(Paint.Style.FILL);
         p.setColor(Color.WHITE);
-        c.drawCircle(cx, cy, r, p);
+        c.drawCircle(cx, cy, radius, p);
 
         p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(3.5f);
-        p.setColor(Color.rgb(220, 45, 45));
-        c.drawCircle(cx, cy, r - 1.5f, p);
+        p.setStrokeWidth(3.4f);
+        p.setColor(Color.rgb(220, 38, 38));
+        c.drawCircle(cx, cy, radius - 1.6f, p);
 
         textPaint.setColor(Color.BLACK);
-        textPaint.setTextSize(limit >= 100 ? 9.5f : 11f);
+        textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        c.drawText(String.valueOf(limit), cx, cy + 3.7f, textPaint);
+        textPaint.setTextSize(limit >= 100 ? 9.5f : 11.5f);
+        c.drawText(String.valueOf(limit), cx, cy + 3.8f, textPaint);
         textPaint.setColor(Color.WHITE);
     }
 
     private void drawRerouteBadge(Canvas c) {
         Paint pill = new Paint(Paint.ANTI_ALIAS_FLAG);
-        pill.setColor(Color.rgb(38, 38, 38));
+        pill.setColor(Color.rgb(35, 35, 35));
         pill.setStyle(Paint.Style.FILL);
-        RectF r = new RectF(83f, 18f, 157f, 42f);
-        c.drawRoundRect(r, 12f, 12f, pill);
+        RectF r = new RectF(76f, 66f, 164f, 89f);
+        c.drawRoundRect(r, 11.5f, 11.5f, pill);
 
-        textPaint.setTextSize(11f);
+        textPaint.setTextSize(10f);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        c.drawText("RICALCOLO", 120f, 34f, textPaint);
+        c.drawText("RICALCOLO", 120f, 81f, textPaint);
     }
 
     private void drawWait(Canvas c) {
-        textPaint.setTextSize(20f);
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        c.drawText("CIAO", 120f, 98f, textPaint);
-
-        mutedTextPaint.setTextSize(13f);
-        c.drawText("attendo navigazione", 120f, 128f, mutedTextPaint);
-
         Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
         ring.setStyle(Paint.Style.STROKE);
-        ring.setStrokeWidth(4f);
         ring.setStrokeCap(Paint.Cap.ROUND);
+
+        ring.setStrokeWidth(2f);
+        ring.setColor(Color.rgb(55, 55, 55));
+        c.drawCircle(120f, 120f, 72f, ring);
+
+        ring.setStrokeWidth(5f);
         ring.setColor(Color.WHITE);
-        RectF r = new RectF(101f, 146f, 139f, 184f);
-        c.drawArc(r, -70f, 230f, false, ring);
+        RectF rr = new RectF(94f, 94f, 146f, 146f);
+        c.drawArc(rr, -75f, 245f, false, ring);
+
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextSize(18f);
+        c.drawText("CIAO", 120f, 72f, textPaint);
+
+        mutedTextPaint.setTextSize(11.5f);
+        mutedTextPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.NORMAL));
+        c.drawText("attendo navigazione", 120f, 170f, mutedTextPaint);
     }
 
     private void drawStop(Canvas c) {
-        textPaint.setTextSize(18f);
-        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        c.drawText("NAVIGAZIONE", 120f, 103f, textPaint);
-        c.drawText("FERMATA", 120f, 128f, textPaint);
+        Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        ring.setStyle(Paint.Style.STROKE);
+        ring.setStrokeWidth(4f);
+        ring.setColor(Color.rgb(80, 80, 80));
+        c.drawCircle(120f, 111f, 36f, ring);
 
-        mutedTextPaint.setTextSize(12f);
-        c.drawText("avvia dal telefono", 120f, 158f, mutedTextPaint);
+        Paint stop = new Paint(Paint.ANTI_ALIAS_FLAG);
+        stop.setStyle(Paint.Style.FILL);
+        stop.setColor(Color.WHITE);
+        c.drawRoundRect(new RectF(109f, 100f, 131f, 122f), 3f, 3f, stop);
+
+        textPaint.setTextSize(17f);
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        c.drawText("NAVIGAZIONE FERMATA", 120f, 166f, textPaint);
+
+        mutedTextPaint.setTextSize(11f);
+        c.drawText("avvia dal telefono", 120f, 185f, mutedTextPaint);
     }
 
     private void drawOffRoute(Canvas c) {
-        // Keep a faint route trace in the background if available.
         ArrayList<PointF> pts = displayPts.isEmpty()
                 ? normalizedRoute(parseLine(line))
                 : copyPoints(displayPts);
 
+        Paint faintShadow = new Paint(routeShadowPaint);
+        faintShadow.setColor(Color.rgb(20, 20, 20));
+        if (pts.size() >= 2) c.drawPath(smoothPath(pts), faintShadow);
+
         Paint faint = new Paint(routePaint);
-        faint.setColor(Color.rgb(85, 85, 85));
-        faint.setStrokeWidth(7f);
+        faint.setColor(Color.rgb(74, 74, 74));
+        faint.setStrokeWidth(7.5f);
         if (pts.size() >= 2) c.drawPath(smoothPath(pts), faint);
 
         drawPositionMarker(c);
 
-        textPaint.setTextSize(18f);
+        Paint pill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        pill.setStyle(Paint.Style.FILL);
+        pill.setColor(Color.WHITE);
+        c.drawRoundRect(new RectF(57f, 24f, 183f, 60f), 18f, 18f, pill);
+
+        textPaint.setColor(Color.BLACK);
+        textPaint.setTextSize(14f);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        c.drawText("FUORI ROTTA", 120f, 55f, textPaint);
+        c.drawText("FUORI ROTTA", 120f, 47f, textPaint);
+        textPaint.setColor(Color.WHITE);
 
-        mutedTextPaint.setTextSize(12f);
-        c.drawText("ricalcolo percorso", 120f, 75f, mutedTextPaint);
+        mutedTextPaint.setTextSize(11f);
+        c.drawText("ricalcolo in corso", 120f, 79f, mutedTextPaint);
 
-        textPaint.setTextSize(24f);
-        c.drawText(formatDistance(Math.round(displayDist)), 120f, 207f, textPaint);
+        textPaint.setTextSize(29f);
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        c.drawText(formatDistance(Math.round(displayDist)), 120f, 215f, textPaint);
     }
 
     private ArrayList<PointF> normalizedRoute(ArrayList<PointF> src) {
@@ -531,8 +656,9 @@ public class NavView extends View {
         float dy = MARKER_Y - first.y;
 
         for (PointF p : src) {
+            // Keep route inside the useful navigation field: top UI 60px, bottom UI ~195px.
             float x = clamp(p.x + dx, 12f, 228f);
-            float y = clamp(p.y + dy, 10f, 170f);
+            float y = clamp(p.y + dy, 61f, 176f);
             out.add(new PointF(x, y));
         }
         return out;
@@ -541,7 +667,7 @@ public class NavView extends View {
     private ArrayList<PointF> normalizedContext(ArrayList<PointF> src) {
         ArrayList<PointF> out = new ArrayList<>();
         for (PointF p : src) {
-            out.add(new PointF(clamp(p.x, 8f, 232f), clamp(p.y, 8f, 178f)));
+            out.add(new PointF(clamp(p.x, 8f, 232f), clamp(p.y, 58f, 190f)));
         }
         return out;
     }
@@ -583,7 +709,7 @@ public class NavView extends View {
         return Math.round(meters / 1000f) + " km";
     }
 
-    private float clamp(float v, float lo, float hi) {
-        return Math.max(lo, Math.min(hi, v));
+    private float clamp(float value, float low, float high) {
+        return Math.max(low, Math.min(high, value));
     }
 }
