@@ -154,6 +154,25 @@ public class MainActivity extends Activity {
         routeMap = new MapView(this);
         routeMap.setTileSource(CIAO_OSM);
         routeMap.setMultiTouchControls(true);
+
+        // Quando il dito è sulla mappa, impedisce allo ScrollView
+        // di intercettare trascinamento e pinch-to-zoom.
+        routeMap.setOnTouchListener((v, event) -> {
+            switch (event.getActionMasked()) {
+                case android.view.MotionEvent.ACTION_DOWN:
+                case android.view.MotionEvent.ACTION_POINTER_DOWN:
+                case android.view.MotionEvent.ACTION_MOVE:
+                    v.getParent().requestDisallowInterceptTouchEvent(true);
+                    break;
+
+                case android.view.MotionEvent.ACTION_UP:
+                case android.view.MotionEvent.ACTION_CANCEL:
+                    v.getParent().requestDisallowInterceptTouchEvent(false);
+                    break;
+            }
+            return false;
+        });
+
         routeMap.getController().setZoom(13.0);
         routeMap.getController().setCenter(new GeoPoint(41.9028, 12.4964));
         root.addView(routeMap, new LinearLayout.LayoutParams(
