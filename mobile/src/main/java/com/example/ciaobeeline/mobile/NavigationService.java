@@ -56,6 +56,9 @@ public class NavigationService extends Service {
     private static final long PERIODIC_RECALC_MS = 30000;
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
+    private static final long HEARTBEAT_MS = 1000;
+    private static final double SCREEN_PIXELS_PER_METER = 0.82;
+    private static final double SCREEN_LOOKAHEAD_METERS = 260.0;
 
     private LocationManager locationManager;
     private Location currentLocation;
@@ -80,6 +83,45 @@ public class NavigationService extends Service {
     private String routeMode = "fastest";
     private boolean allowFastRoads = false;
     private PowerManager.WakeLock wakeLock;
+
+    // Keeps navigation updates alive even when Android reduces GPS callback frequency
+    // after the phone display turns off. The foreground service + partial wake lock
+    // remain the primary mechanism; this is a lightweight 1 Hz safety heartbeat.
+    private final Runnable heartbeat = new Runnable() {
+        @Override
+        public void run() {
+            if (!running) return;
+
+            try {
+                Location gps = null;
+                Location network = null;
+
+                if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                    gps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                    network = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                }
+
+                Location last = bestLocation(gps, network);
+                if (last != null && (currentLocation == null || last.getTime() >= currentLocation.getTime())) {
+                    currentLocation = last;
+                }
+            } catch (Exception ignored) {
+            }
+
+            if (currentLocation != null) {
+                boolean empty;
+                synchronized (route) { empty = route.isEmpty(); }
+
+                if (empty) {
+                    requestRoute(false);
+                } else {
+                    sendNavUpdate(false);
+                }
+            }
+
+            if (running) handler.postDelayed(this, HEARTBEAT_MS);
+        }
+    };
 
     @Override
     public void onCreate() {
@@ -123,6 +165,8 @@ public class NavigationService extends Service {
         running = true;
         routeRequestInProgress = false;
         acquireWakeLock();
+        handler.removeCallbacks(heartbeat);
+        handler.post(heartbeat);
 
         synchronized (route) { route.clear(); }
         synchronized (maneuvers) { maneuvers.clear(); }
@@ -172,6 +216,7 @@ public class NavigationService extends Service {
     private void stopRouting() {
         running = false;
         routeRequestInProgress = false;
+        handler.removeCallbacks(heartbeat);
         releaseWakeLock();
         try { locationManager.removeUpdates(listener); } catch (Exception ignored) {}
         updateNotification("Navigazione fermata", "");
@@ -651,7 +696,9 @@ public class NavigationService extends Service {
     private void acquireWakeLock() {
         try {
             if (wakeLock != null && !wakeLock.isHeld()) {
-                wakeLock.acquire(3 * 60 * 60 * 1000L);
+                // Navigation can legitimately last more than three hours.
+                // Release is explicit in stopRouting()/onDestroy().
+                wakeLock.acquire();
             }
         } catch (Exception ignored) {
         }
@@ -877,58 +924,84 @@ public class NavigationService extends Service {
     }
 
     private static String buildScreenLine(ArrayList<LatLon> pts, RouteMatch match, Location loc) {
-        int idx = match.index;
+        int idx = Math.max(0, Math.min(match.index, pts.size() - 1));
 
-        if (idx >= pts.size()) return "120,140;120,70";
+        if (pts.size() < 2 || idx >= pts.size() - 1) {
+            return "120,164;120,90";
+        }
+
+        /*
+         * V0.20 faithful geometry:
+         * - use the real ORS polyline;
+         * - local metric projection (east/north) around the snapped rider position;
+         * - rotate the whole geometry heading-up;
+         * - never clamp every point to the screen edge (that was distorting curves
+         *   and especially roundabouts);
+         * - the round display clips naturally on the watch.
+         */
+        double lat0 = match.lat;
+        double lon0 = match.lon;
+        double lat0Rad = Math.toRadians(lat0);
+        double metersPerDegLat = 111320.0;
+        double metersPerDegLon = Math.max(1.0, Math.cos(lat0Rad) * 111320.0);
+
+        LatLon next = pts.get(Math.min(idx + 1, pts.size() - 1));
+        double head = bearing(lat0, lon0, next.lat, next.lon);
 
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
-        double head = routeHeading(pts, idx);
-
         if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
             double gpsHead = loc.getBearing();
             double diff = Math.abs(angleDiff(head, gpsHead));
-
-            if (diff < 35) {
-                head = gpsHead;
-            }
+            if (diff < 55.0) head = gpsHead;
         }
+
+        double h = Math.toRadians(head);
+        double sinH = Math.sin(h);
+        double cosH = Math.cos(h);
+
+        final double originX = 120.0;
+        final double originY = 164.0;
 
         StringBuilder sb = new StringBuilder();
+        sb.append("120,164");
 
-        double lat0 = match.lat;
-        double lon0 = match.lon;
+        int added = 1;
+        double walked = 0.0;
+        LatLon prev = new LatLon(lat0, lon0);
+        double lastAddedEast = 0.0;
+        double lastAddedNorth = 0.0;
 
-        int added = 0;
-
-        sb.append("120,140");
-        added++;
-
-        for (int i = Math.max(idx + 1, 0); i < pts.size() && added < 28; i++) {
+        for (int i = idx + 1; i < pts.size() && added < 90; i++) {
             LatLon p = pts.get(i);
-            double dist = distanceMeters(lat0, lon0, p.lat, p.lon);
 
-            if (dist < 4) continue;
-            if (dist > 330 && added > 6) break;
+            walked += distanceMeters(prev.lat, prev.lon, p.lat, p.lon);
+            prev = p;
 
-            double br = bearing(lat0, lon0, p.lat, p.lon);
-            double rel = Math.toRadians(angleDiff(head, br));
-            double x = Math.sin(rel) * dist;
-            double y = Math.cos(rel) * dist;
+            double east = (p.lon - lon0) * metersPerDegLon;
+            double north = (p.lat - lat0) * metersPerDegLat;
 
-            int sx = (int) Math.round(120 + x * 0.58);
-            int sy = (int) Math.round(140 - y * 0.58);
+            // Preserve small roundabout/curve details but avoid flooding the Data Layer.
+            double spacing = Math.hypot(east - lastAddedEast, north - lastAddedNorth);
+            if (spacing < 1.8 && i < pts.size() - 1) continue;
 
-            sx = Math.max(18, Math.min(222, sx));
-            sy = Math.max(18, Math.min(148, sy));
+            // Heading-up: right is +x, forward is -y on the display.
+            double right = east * cosH - north * sinH;
+            double forward = east * sinH + north * cosH;
 
+            int sx = (int) Math.round(originX + right * SCREEN_PIXELS_PER_METER);
+            int sy = (int) Math.round(originY - forward * SCREEN_PIXELS_PER_METER);
+
+            // Do NOT clamp sx/sy: clipping on the round watch preserves geometry.
             sb.append(';').append(sx).append(',').append(sy);
             added++;
+
+            lastAddedEast = east;
+            lastAddedNorth = north;
+
+            if (walked >= SCREEN_LOOKAHEAD_METERS && added > 10) break;
         }
 
-        if (added < 2) {
-            sb.append(";120,70");
-        }
-
+        if (added < 2) sb.append(";120,90");
         return sb.toString();
     }
 
