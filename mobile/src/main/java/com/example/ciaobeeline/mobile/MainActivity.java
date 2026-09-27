@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Point;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -187,7 +188,14 @@ public class MainActivity extends Activity {
 
             @Override
             public boolean longPressHelper(GeoPoint p) {
-                addSelectedRoutePoint(p);
+                // Se la pressione lunga è sopra (o molto vicina a) un punto già scelto,
+                // lo elimina. Altrimenti aggiunge un nuovo punto.
+                int existingIndex = findSelectedRoutePointNear(p);
+                if (existingIndex >= 0) {
+                    removeSelectedRoutePoint(existingIndex);
+                } else {
+                    addSelectedRoutePoint(p);
+                }
                 return true;
             }
         });
@@ -393,6 +401,59 @@ public class MainActivity extends Activity {
             status.setText(count + " punti selezionati: " + waypointCount +
                     (waypointCount == 1 ? " waypoint. " : " waypoint. ") +
                     "Premi VEDI TRAGITTO SU MAPPA per calcolare il percorso.");
+        }
+    }
+
+    private int findSelectedRoutePointNear(GeoPoint pressedPoint) {
+        if (routeMap == null || selectedRoutePoints.isEmpty()) return -1;
+
+        Point pressedPx = routeMap.getProjection().toPixels(pressedPoint, null);
+        float density = getResources().getDisplayMetrics().density;
+        double hitRadiusPx = 42.0 * density;
+        double bestDistance = hitRadiusPx;
+        int bestIndex = -1;
+
+        for (int i = 0; i < selectedRoutePoints.size(); i++) {
+            Point pointPx = routeMap.getProjection().toPixels(selectedRoutePoints.get(i), null);
+            double dx = pointPx.x - pressedPx.x;
+            double dy = pointPx.y - pressedPx.y;
+            double distance = Math.sqrt(dx * dx + dy * dy);
+
+            if (distance <= bestDistance) {
+                bestDistance = distance;
+                bestIndex = i;
+            }
+        }
+
+        return bestIndex;
+    }
+
+    private void removeSelectedRoutePoint(int index) {
+        if (index < 0 || index >= selectedRoutePoints.size()) return;
+
+        int oldCount = selectedRoutePoints.size();
+        String removedType;
+        if (index == 0) {
+            removedType = "Partenza";
+        } else if (index == oldCount - 1) {
+            removedType = "Arrivo";
+        } else {
+            removedType = "Waypoint " + (index + 1);
+        }
+
+        selectedRoutePoints.remove(index);
+        redrawSelectedRoutePoints();
+
+        int count = selectedRoutePoints.size();
+        if (count == 0) {
+            status.setText(removedType + " eliminato. Nessun punto selezionato.");
+        } else if (count == 1) {
+            status.setText(removedType + " eliminato. Rimane solo la partenza: seleziona almeno un altro punto.");
+        } else {
+            int waypointCount = Math.max(0, count - 2);
+            status.setText(removedType + " eliminato. " + count + " punti selezionati: " +
+                    waypointCount + (waypointCount == 1 ? " waypoint." : " waypoint.") +
+                    " Premi VEDI TRAGITTO SU MAPPA per ricalcolare.");
         }
     }
 
