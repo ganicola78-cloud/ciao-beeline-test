@@ -140,14 +140,12 @@ public class NavView extends View {
                 line = newLine;
                 ArrayList<PointF> parsed = normalizedRoute(parseLine(line));
                 if (!parsed.isEmpty()) {
+                    // Geometry is replaced atomically: morphing points with different
+                    // counts bends the road and makes roundabouts look wrong.
                     targetPts.clear();
                     targetPts.addAll(parsed);
-
-                    if (displayPts.isEmpty()) {
-                        displayPts.addAll(copyPoints(targetPts));
-                    } else {
-                        resampleDisplayToTargetCount();
-                    }
+                    displayPts.clear();
+                    displayPts.addAll(copyPoints(parsed));
                 }
             }
 
@@ -167,26 +165,6 @@ public class NavView extends View {
         @Override
         public void run() {
             boolean keepGoing = false;
-
-            if (!targetPts.isEmpty()) {
-                if (displayPts.isEmpty()) displayPts.addAll(copyPoints(targetPts));
-                resampleDisplayToTargetCount();
-
-                for (int i = 0; i < targetPts.size(); i++) {
-                    PointF d = displayPts.get(i);
-                    PointF t = targetPts.get(i);
-
-                    float dx = t.x - d.x;
-                    float dy = t.y - d.y;
-
-                    d.x += dx * 0.22f;
-                    d.y += dy * 0.22f;
-
-                    if (Math.abs(dx) > 0.35f || Math.abs(dy) > 0.35f) {
-                        keepGoing = true;
-                    }
-                }
-            }
 
             float dd = dist - displayDist;
             displayDist += dd * 0.28f;
@@ -285,34 +263,22 @@ public class NavView extends View {
     private void drawRoute(Canvas c, ArrayList<PointF> pts) {
         if (pts.size() < 2) return;
 
-        Path p = smoothPath(pts);
+        Path p = exactPath(pts);
         c.drawPath(p, routeShadowPaint);
         c.drawPath(p, routePaint);
     }
 
-    private Path smoothPath(ArrayList<PointF> pts) {
+    private Path exactPath(ArrayList<PointF> pts) {
         Path path = new Path();
         if (pts.isEmpty()) return path;
 
         path.moveTo(pts.get(0).x, pts.get(0).y);
-
-        if (pts.size() == 2) {
-            path.lineTo(pts.get(1).x, pts.get(1).y);
-            return path;
+        for (int i = 1; i < pts.size(); i++) {
+            path.lineTo(pts.get(i).x, pts.get(i).y);
         }
-
-        for (int i = 1; i < pts.size() - 1; i++) {
-            PointF cur = pts.get(i);
-            PointF next = pts.get(i + 1);
-            float mx = (cur.x + next.x) * 0.5f;
-            float my = (cur.y + next.y) * 0.5f;
-            path.quadTo(cur.x, cur.y, mx, my);
-        }
-
-        PointF last = pts.get(pts.size() - 1);
-        path.lineTo(last.x, last.y);
         return path;
     }
+
 
     private void drawContextRoads(Canvas c) {
         if (roads == null || roads.trim().isEmpty()) return;
@@ -322,7 +288,7 @@ public class NavView extends View {
             ArrayList<PointF> pts = normalizedContext(parseLine(polyline));
             if (pts.size() < 2) continue;
 
-            Path p = smoothPath(pts);
+            Path p = exactPath(pts);
             c.drawPath(p, roadPaint);
         }
     }
@@ -619,12 +585,12 @@ public class NavView extends View {
 
         Paint faintShadow = new Paint(routeShadowPaint);
         faintShadow.setColor(Color.rgb(20, 20, 20));
-        if (pts.size() >= 2) c.drawPath(smoothPath(pts), faintShadow);
+        if (pts.size() >= 2) c.drawPath(exactPath(pts), faintShadow);
 
         Paint faint = new Paint(routePaint);
         faint.setColor(Color.rgb(74, 74, 74));
         faint.setStrokeWidth(7.5f);
-        if (pts.size() >= 2) c.drawPath(smoothPath(pts), faint);
+        if (pts.size() >= 2) c.drawPath(exactPath(pts), faint);
 
         drawPositionMarker(c);
 
@@ -651,15 +617,14 @@ public class NavView extends View {
         ArrayList<PointF> out = new ArrayList<>();
         if (src.isEmpty()) return out;
 
+        // Only anchor the first point to the rider marker.
+        // Never clamp individual points: clamping deforms curves and roundabouts.
         PointF first = src.get(0);
         float dx = MARKER_X - first.x;
         float dy = MARKER_Y - first.y;
 
         for (PointF p : src) {
-            // Keep route inside the useful navigation field: top UI 60px, bottom UI ~195px.
-            float x = clamp(p.x + dx, 12f, 228f);
-            float y = clamp(p.y + dy, 61f, 176f);
-            out.add(new PointF(x, y));
+            out.add(new PointF(p.x + dx, p.y + dy));
         }
         return out;
     }
