@@ -36,7 +36,9 @@ import java.util.ArrayList;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.osmdroid.config.Configuration;
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory;
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase;
+import org.osmdroid.tileprovider.tilesource.TileSourcePolicy;
+import org.osmdroid.tileprovider.tilesource.XYTileSource;
 import org.osmdroid.util.BoundingBox;
 import org.osmdroid.util.GeoPoint;
 import org.osmdroid.views.MapView;
@@ -50,6 +52,24 @@ public class MainActivity extends Activity {
     private static final String PREF_DESTINATION = "destination_text";
     private static final String PREF_ROUTE_MODE = "route_mode";
     private static final String PREF_ALLOW_FAST_ROADS = "allow_fast_roads";
+
+    // Tile source OSM con User-Agent esplicito: evita il profilo MAPNIK di osmdroid
+    // che forza il User-Agent normalizzato package/versione.
+    private static final OnlineTileSourceBase CIAO_OSM = new XYTileSource(
+            "CiaoBeelineOSM",
+            0,
+            19,
+            256,
+            ".png",
+            new String[]{"https://tile.openstreetmap.org/"},
+            "© OpenStreetMap contributors",
+            new TileSourcePolicy(
+                    2,
+                    TileSourcePolicy.FLAG_NO_BULK
+                            | TileSourcePolicy.FLAG_NO_PREVENTIVE
+                            | TileSourcePolicy.FLAG_USER_AGENT_MEANINGFUL
+            )
+    );
 
     private EditText apiKeyEdit;
     private EditText destinationEdit;
@@ -68,7 +88,7 @@ public class MainActivity extends Activity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         Configuration.getInstance().load(getApplicationContext(), getSharedPreferences("osmdroid", MODE_PRIVATE));
-        Configuration.getInstance().setUserAgentValue(getPackageName());
+        Configuration.getInstance().setUserAgentValue("CiaoBeeline/1.0 (Android; com.example.ciaobeeline.mobile)");
 
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(false);
@@ -132,7 +152,7 @@ public class MainActivity extends Activity {
         root.addView(status);
 
         routeMap = new MapView(this);
-        routeMap.setTileSource(TileSourceFactory.MAPNIK);
+        routeMap.setTileSource(CIAO_OSM);
         routeMap.setMultiTouchControls(true);
         routeMap.getController().setZoom(13.0);
         routeMap.getController().setCenter(new GeoPoint(41.9028, 12.4964));
