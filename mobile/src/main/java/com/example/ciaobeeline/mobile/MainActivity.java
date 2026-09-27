@@ -375,7 +375,7 @@ public class MainActivity extends Activity {
 
     private LatLon previewGeocodeDestination(String key, String destinationText) throws Exception {
         String encoded = URLEncoder.encode(destinationText, "UTF-8");
-        URL url = new URL("https://api.openrouteservice.org/geocode/search?api_key=" + key + "&text=" + encoded + "&size=1");
+        URL url = new URL("https://api.heigit.org/pelias/v1/search?api_key=" + key + "&text=" + encoded + "&size=1");
 
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
         c.setRequestMethod("GET");
@@ -395,7 +395,7 @@ public class MainActivity extends Activity {
     }
 
     private PreviewRoute previewRequestDirections(String key, Location startLocation, LatLon dest) throws Exception {
-        URL url = new URL("https://api.openrouteservice.org/v2/directions/driving-car/geojson");
+        URL url = new URL("https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson");
 
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
         c.setRequestMethod("POST");
