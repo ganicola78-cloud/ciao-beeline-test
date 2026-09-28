@@ -44,6 +44,11 @@ public class NavigationService extends Service {
     private static final String PREF_DESTINATION = "destination_text";
     private static final String PREF_ROUTE_MODE = "route_mode";
     private static final String PREF_ALLOW_FAST_ROADS = "allow_fast_roads";
+    private static final String PREF_NAV_SOURCE = "nav_source_v1";
+    private static final String PREF_NAV_TARGET_LAT = "nav_target_lat_v1";
+    private static final String PREF_NAV_TARGET_LON = "nav_target_lon_v1";
+    private static final String PREF_NAV_TARGET_LABEL = "nav_target_label_v1";
+    private static final String PREF_NAV_ROUTE_POINTS = "nav_route_points_v1";
     public static final String ACTION_START = "com.example.ciaobeeline.START_NAV";
     public static final String ACTION_STOP = "com.example.ciaobeeline.STOP_NAV";
     private static final String CHANNEL_ID = "ciao_beeline_navigation";
@@ -96,6 +101,11 @@ public class NavigationService extends Service {
     private String destinationText = "";
     private String routeMode = "fastest";
     private boolean allowFastRoads = false;
+    private String navSource = "text";
+    private LatLon directTarget = null;
+    private String directTargetLabel = "";
+    private final ArrayList<LatLon> plannedRoutePoints = new ArrayList<>();
+    private int plannedWaypointStartIndex = 0;
     private PowerManager.WakeLock wakeLock;
 
     // Keeps navigation updates alive even when Android reduces GPS callback frequency
@@ -123,6 +133,7 @@ public class NavigationService extends Service {
             }
 
             if (currentLocation != null) {
+                updatePlannedWaypointProgress();
                 boolean empty;
                 synchronized (route) { empty = route.isEmpty(); }
 
@@ -193,6 +204,7 @@ public class NavigationService extends Service {
         loadPrefsForService();
         running = true;
         routeRequestInProgress = false;
+        plannedWaypointStartIndex = 0;
         acquireWakeLock();
         handler.removeCallbacks(heartbeat);
         handler.post(heartbeat);
@@ -266,6 +278,7 @@ public class NavigationService extends Service {
 
     private final LocationListener listener = loc -> {
         currentLocation = loc;
+        updatePlannedWaypointProgress();
         if (!running) return;
 
         long now = System.currentTimeMillis();
@@ -308,14 +321,23 @@ public class NavigationService extends Service {
 
         final String key = apiKey.trim();
         final String destinationText = this.destinationText.trim();
+        final String source = navSource == null ? "text" : navSource;
 
         if (key.length() < 8) {
             updateNotification("Errore", "Inserisci API key OpenRouteService.");
             return;
         }
 
-        if (destinationText.length() < 3) {
+        if ("text".equals(source) && destinationText.length() < 3) {
             updateNotification("Errore", "Inserisci una destinazione.");
+            return;
+        }
+        if ("point".equals(source) && directTarget == null) {
+            updateNotification("Errore", "Punto salvato non valido.");
+            return;
+        }
+        if ("route".equals(source) && plannedRoutePoints.size() < 2) {
+            updateNotification("Errore", "Tragitto salvato non valido.");
             return;
         }
 
@@ -323,22 +345,29 @@ public class NavigationService extends Service {
         lastRouteMs = System.currentTimeMillis();
 
         if (forceStatus) {
-            updateNotification("Ricalcolo rotta", "");
+            updateNotification("Ricalcolo rotta", navigationLabel());
             sendToWear("{\"mode\":\"REROUTE\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,140;120,105;120,70;120,40\"}");
         }
 
         new Thread(() -> {
             try {
-                LatLon dest;
-                if (lastDestination != null && destinationText.equals(lastDestinationText)) {
-                    dest = lastDestination;
-                } else {
-                    dest = geocodeDestination(key, destinationText);
-                    lastDestination = dest;
-                    lastDestinationText = destinationText;
-                }
+                RouteResult result;
 
-                RouteResult result = requestDirections(key, dest);
+                if ("route".equals(source)) {
+                    result = requestDirectionsViaPlannedRoute(key);
+                } else {
+                    LatLon dest;
+                    if ("point".equals(source)) {
+                        dest = directTarget;
+                    } else if (lastDestination != null && destinationText.equals(lastDestinationText)) {
+                        dest = lastDestination;
+                    } else {
+                        dest = geocodeDestination(key, destinationText);
+                        lastDestination = dest;
+                        lastDestinationText = destinationText;
+                    }
+                    result = requestDirections(key, dest);
+                }
 
                 synchronized (route) {
                     route.clear();
@@ -351,7 +380,10 @@ public class NavigationService extends Service {
 
                 handler.post(() -> {
                     routeRequestInProgress = false;
-                    updateNotification("Rotta aggiornata", destinationText + " - " + ("shortest".equals(routeMode) ? "breve" : "veloce") + (allowFastRoads ? " + strade veloci" : " no autostrade") + " - svolte: " + result.maneuvers.size());
+                    updateNotification("Rotta aggiornata", navigationLabel() + " - " +
+                            ("shortest".equals(routeMode) ? "breve" : "veloce") +
+                            (allowFastRoads ? " + strade veloci" : " no autostrade") +
+                            " - svolte: " + result.maneuvers.size());
                     sendNavUpdate(true);
                 });
             } catch (Exception e) {
@@ -361,6 +393,25 @@ public class NavigationService extends Service {
                 });
             }
         }).start();
+    }
+
+    private String navigationLabel() {
+        if ("point".equals(navSource)) {
+            return directTargetLabel == null || directTargetLabel.trim().isEmpty() ? "Punto salvato" : directTargetLabel;
+        }
+        if ("route".equals(navSource)) return "Tragitto con waypoint";
+        return destinationText == null ? "Destinazione" : destinationText;
+    }
+
+    private void updatePlannedWaypointProgress() {
+        if (!"route".equals(navSource) || currentLocation == null || plannedRoutePoints.size() < 2) return;
+
+        while (plannedWaypointStartIndex < plannedRoutePoints.size() - 1) {
+            LatLon next = plannedRoutePoints.get(plannedWaypointStartIndex);
+            double d = distanceMeters(currentLocation.getLatitude(), currentLocation.getLongitude(), next.lat, next.lon);
+            if (d <= 90.0) plannedWaypointStartIndex++;
+            else break;
+        }
     }
 
     private LatLon geocodeDestination(String key, String destinationText) throws Exception {
@@ -385,6 +436,35 @@ public class NavigationService extends Service {
     }
 
     private RouteResult requestDirections(String key, LatLon dest) throws Exception {
+        ArrayList<LatLon> coordinates = new ArrayList<>();
+        coordinates.add(new LatLon(currentLocation.getLatitude(), currentLocation.getLongitude()));
+        coordinates.add(dest);
+        return requestDirectionsForCoordinates(key, coordinates);
+    }
+
+    private RouteResult requestDirectionsViaPlannedRoute(String key) throws Exception {
+        ArrayList<LatLon> coordinates = new ArrayList<>();
+        coordinates.add(new LatLon(currentLocation.getLatitude(), currentLocation.getLongitude()));
+
+        int start = Math.max(0, Math.min(plannedWaypointStartIndex, plannedRoutePoints.size() - 1));
+        for (int i = start; i < plannedRoutePoints.size(); i++) {
+            LatLon p = plannedRoutePoints.get(i);
+            if (coordinates.size() == 1 && i < plannedRoutePoints.size() - 1) {
+                LatLon current = coordinates.get(0);
+                if (distanceMeters(current.lat, current.lon, p.lat, p.lon) < 15.0) continue;
+            }
+            coordinates.add(new LatLon(p.lat, p.lon));
+        }
+
+        if (coordinates.size() < 2) {
+            LatLon last = plannedRoutePoints.get(plannedRoutePoints.size() - 1);
+            coordinates.add(new LatLon(last.lat, last.lon));
+        }
+
+        return requestDirectionsForCoordinates(key, coordinates);
+    }
+
+    private RouteResult requestDirectionsForCoordinates(String key, ArrayList<LatLon> coordinates) throws Exception {
         URL url = new URL("https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson");
 
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
@@ -395,26 +475,21 @@ public class NavigationService extends Service {
 
         String preference = "shortest".equals(routeMode) ? "shortest" : "fastest";
 
-        // V0.19:
-        // - PIÙ VELOCE / PIÙ BREVE cambiano la preference ORS.
-        // - AUTOSTRADE / SUPERSTRADE: SÌ = non evita highways/tollways.
-        // - AUTOSTRADE / SUPERSTRADE: NO = evita highways/tollways.
-        String body;
-        if (allowFastRoads) {
-            body = "{\"coordinates\":[[" +
-                    currentLocation.getLongitude() + "," + currentLocation.getLatitude() + "],[" +
-                    dest.lon + "," + dest.lat + "]]," +
-                    "\"preference\":\"" + preference + "\"}";
-        } else {
-            body = "{\"coordinates\":[[" +
-                    currentLocation.getLongitude() + "," + currentLocation.getLatitude() + "],[" +
-                    dest.lon + "," + dest.lat + "]]," +
-                    "\"preference\":\"" + preference + "\"," +
-                    "\"options\":{\"avoid_features\":[\"highways\",\"tollways\"]}}";
+        StringBuilder body = new StringBuilder();
+        body.append("{\"coordinates\":[");
+        for (int i = 0; i < coordinates.size(); i++) {
+            if (i > 0) body.append(',');
+            LatLon p = coordinates.get(i);
+            body.append('[').append(p.lon).append(',').append(p.lat).append(']');
         }
+        body.append("],\"preference\":\"").append(preference).append("\"");
+        if (!allowFastRoads) {
+            body.append(",\"options\":{\"avoid_features\":[\"highways\",\"tollways\"]}");
+        }
+        body.append('}');
 
         try (OutputStream os = c.getOutputStream()) {
-            os.write(body.getBytes(StandardCharsets.UTF_8));
+            os.write(body.toString().getBytes(StandardCharsets.UTF_8));
         }
 
         InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
@@ -918,6 +993,34 @@ public class NavigationService extends Service {
         destinationText = p.getString(PREF_DESTINATION, "");
         routeMode = p.getString(PREF_ROUTE_MODE, "fastest");
         allowFastRoads = p.getBoolean(PREF_ALLOW_FAST_ROADS, false);
+        navSource = p.getString(PREF_NAV_SOURCE, "text");
+        directTargetLabel = p.getString(PREF_NAV_TARGET_LABEL, "");
+        directTarget = null;
+        plannedRoutePoints.clear();
+        plannedWaypointStartIndex = 0;
+
+        try {
+            String latRaw = p.getString(PREF_NAV_TARGET_LAT, "");
+            String lonRaw = p.getString(PREF_NAV_TARGET_LON, "");
+            if (!latRaw.isEmpty() && !lonRaw.isEmpty()) {
+                directTarget = new LatLon(Double.parseDouble(latRaw), Double.parseDouble(lonRaw));
+            }
+        } catch (Exception ignored) {
+            directTarget = null;
+        }
+
+        try {
+            JSONArray a = new JSONArray(p.getString(PREF_NAV_ROUTE_POINTS, "[]"));
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i);
+                if (o == null) continue;
+                double lat = o.optDouble("lat", Double.NaN);
+                double lon = o.optDouble("lon", Double.NaN);
+                if (!Double.isNaN(lat) && !Double.isNaN(lon)) plannedRoutePoints.add(new LatLon(lat, lon));
+            }
+        } catch (Exception ignored) {
+            plannedRoutePoints.clear();
+        }
     }
 
     private void acquireWakeLock() {

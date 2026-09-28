@@ -57,6 +57,13 @@ public class MainActivity extends Activity {
     private static final String PREF_ROUTE_MODE = "route_mode";
     private static final String PREF_ALLOW_FAST_ROADS = "allow_fast_roads";
     private static final String PREF_FAVORITES = "favorite_destinations_v1";
+    private static final String PREF_SAVED_POINTS = "saved_map_points_v1";
+    private static final String PREF_SAVED_ROUTES = "saved_routes_v1";
+    private static final String PREF_NAV_SOURCE = "nav_source_v1";
+    private static final String PREF_NAV_TARGET_LAT = "nav_target_lat_v1";
+    private static final String PREF_NAV_TARGET_LON = "nav_target_lon_v1";
+    private static final String PREF_NAV_TARGET_LABEL = "nav_target_label_v1";
+    private static final String PREF_NAV_ROUTE_POINTS = "nav_route_points_v1";
 
     // Tile source OSM con User-Agent esplicito: evita il profilo MAPNIK di osmdroid
     // che forza il User-Agent normalizzato package/versione.
@@ -87,8 +94,15 @@ public class MainActivity extends Activity {
     private MapView routeMap;
     private MapEventsOverlay mapEventsOverlay;
     private LinearLayout favoritesContainer;
+    private LinearLayout savedPointsContainer;
+    private LinearLayout savedRoutesContainer;
+    private Button saveMapPointButton;
+    private Button saveRouteButton;
+    private int lastSelectedPointIndex = -1;
     private final ArrayList<GeoPoint> selectedRoutePoints = new ArrayList<>();
     private final ArrayList<Favorite> favorites = new ArrayList<>();
+    private final ArrayList<SavedPoint> savedPoints = new ArrayList<>();
+    private final ArrayList<SavedRoute> savedRoutes = new ArrayList<>();
 
     @Override
     public void onCreate(Bundle b) {
@@ -143,6 +157,26 @@ public class MainActivity extends Activity {
         favoritesContainer.setOrientation(LinearLayout.VERTICAL);
         root.addView(favoritesContainer);
 
+        TextView savedPointsTitle = new TextView(this);
+        savedPointsTitle.setText("Punti salvati");
+        savedPointsTitle.setTextSize(16);
+        savedPointsTitle.setPadding(0, 10, 0, 4);
+        root.addView(savedPointsTitle);
+
+        savedPointsContainer = new LinearLayout(this);
+        savedPointsContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(savedPointsContainer);
+
+        TextView savedRoutesTitle = new TextView(this);
+        savedRoutesTitle.setText("Tragitti salvati");
+        savedRoutesTitle.setTextSize(16);
+        savedRoutesTitle.setPadding(0, 10, 0, 4);
+        root.addView(savedRoutesTitle);
+
+        savedRoutesContainer = new LinearLayout(this);
+        savedRoutesContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(savedRoutesContainer);
+
         fastestButton = new Button(this);
         fastestButton.setText("TRAGITTO: PIÙ VELOCE");
         root.addView(fastestButton);
@@ -154,6 +188,14 @@ public class MainActivity extends Activity {
         fastRoadsButton = new Button(this);
         fastRoadsButton.setText("AUTOSTRADE / SUPERSTRADE");
         root.addView(fastRoadsButton);
+
+        saveMapPointButton = new Button(this);
+        saveMapPointButton.setText("SALVA ULTIMO PUNTO MAPPA");
+        root.addView(saveMapPointButton);
+
+        saveRouteButton = new Button(this);
+        saveRouteButton.setText("SALVA TRAGITTO");
+        root.addView(saveRouteButton);
 
         Button preview = new Button(this);
         preview.setText("VEDI TRAGITTO SU MAPPA");
@@ -236,10 +278,16 @@ public class MainActivity extends Activity {
 
         loadPrefs();
         loadFavorites();
+        loadSavedPoints();
+        loadSavedRoutes();
         refreshFavoritesUi();
+        refreshSavedPointsUi();
+        refreshSavedRoutesUi();
         updateRouteModeButtons();
 
         saveFavoriteButton.setOnClickListener(v -> showSaveFavoriteDialog());
+        saveMapPointButton.setOnClickListener(v -> showSaveMapPointDialog());
+        saveRouteButton.setOnClickListener(v -> showSaveRouteDialog());
 
         fastestButton.setOnClickListener(v -> {
             routeMode = "fastest";
@@ -371,6 +419,7 @@ public class MainActivity extends Activity {
             b.setText("★ " + f.name);
             b.setOnClickListener(v -> {
                 Favorite selected = favorites.get(index);
+                clearSelectedRoutePoints(false);
                 destinationEdit.setText(selected.address);
                 savePrefs();
                 status.setText("Destinazione selezionata: " + selected.name);
@@ -464,6 +513,491 @@ public class MainActivity extends Activity {
         persistFavorites();
         refreshFavoritesUi();
         status.setText("Preferito eliminato: " + name);
+    }
+
+
+    private void loadSavedPoints() {
+        savedPoints.clear();
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_SAVED_POINTS, "[]");
+        try {
+            JSONArray a = new JSONArray(raw);
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i);
+                if (o == null) continue;
+                String name = o.optString("name", "").trim();
+                double lat = o.optDouble("lat", Double.NaN);
+                double lon = o.optDouble("lon", Double.NaN);
+                if (!name.isEmpty() && !Double.isNaN(lat) && !Double.isNaN(lon)) {
+                    savedPoints.add(new SavedPoint(name, lat, lon));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void persistSavedPoints() {
+        JSONArray a = new JSONArray();
+        try {
+            for (SavedPoint p : savedPoints) {
+                JSONObject o = new JSONObject();
+                o.put("name", p.name);
+                o.put("lat", p.lat);
+                o.put("lon", p.lon);
+                a.put(o);
+            }
+        } catch (Exception ignored) {
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(PREF_SAVED_POINTS, a.toString())
+                .apply();
+    }
+
+    private void refreshSavedPointsUi() {
+        if (savedPointsContainer == null) return;
+        savedPointsContainer.removeAllViews();
+
+        if (savedPoints.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("Nessun punto salvato");
+            empty.setTextSize(13);
+            savedPointsContainer.addView(empty);
+            return;
+        }
+
+        for (int i = 0; i < savedPoints.size(); i++) {
+            final int index = i;
+            SavedPoint p = savedPoints.get(i);
+            Button b = new Button(this);
+            b.setAllCaps(false);
+            b.setText("● " + p.name);
+            b.setOnClickListener(v -> showSavedPointActions(index));
+            b.setOnLongClickListener(v -> {
+                showSavedPointRenameDelete(index);
+                return true;
+            });
+            savedPointsContainer.addView(b);
+        }
+    }
+
+    private void showSaveMapPointDialog() {
+        if (selectedRoutePoints.isEmpty()) {
+            status.setText("Seleziona prima un punto sulla mappa con una pressione lunga.");
+            return;
+        }
+
+        int index = lastSelectedPointIndex;
+        if (index < 0 || index >= selectedRoutePoints.size()) index = selectedRoutePoints.size() - 1;
+        final GeoPoint point = selectedRoutePoints.get(index);
+
+        EditText nameEdit = new EditText(this);
+        nameEdit.setHint("Nome, es. Campo di atletica");
+
+        new AlertDialog.Builder(this)
+                .setTitle("Salva punto sulla mappa")
+                .setMessage(String.format(java.util.Locale.US, "%.6f, %.6f", point.getLatitude(), point.getLongitude()))
+                .setView(nameEdit)
+                .setNegativeButton("Annulla", null)
+                .setPositiveButton("Salva", (dialog, which) -> {
+                    String name = nameEdit.getText().toString().trim();
+                    if (name.isEmpty()) name = "Punto " + (savedPoints.size() + 1);
+
+                    int existing = findSavedPointNear(point.getLatitude(), point.getLongitude(), 5.0);
+                    if (existing >= 0) {
+                        savedPoints.get(existing).name = name;
+                        savedPoints.get(existing).lat = point.getLatitude();
+                        savedPoints.get(existing).lon = point.getLongitude();
+                    } else {
+                        savedPoints.add(new SavedPoint(name, point.getLatitude(), point.getLongitude()));
+                    }
+
+                    persistSavedPoints();
+                    refreshSavedPointsUi();
+                    status.setText("Punto salvato: " + name);
+                })
+                .show();
+    }
+
+    private int findSavedPointNear(double lat, double lon, double maxMeters) {
+        for (int i = 0; i < savedPoints.size(); i++) {
+            SavedPoint p = savedPoints.get(i);
+            if (distanceMetersLocal(lat, lon, p.lat, p.lon) <= maxMeters) return i;
+        }
+        return -1;
+    }
+
+    private void showSavedPointActions(int index) {
+        if (index < 0 || index >= savedPoints.size()) return;
+        SavedPoint p = savedPoints.get(index);
+        new AlertDialog.Builder(this)
+                .setTitle(p.name)
+                .setItems(new String[]{"Naviga qui", "Aggiungi come waypoint", "Usa come partenza", "Rinomina", "Elimina"},
+                        (dialog, which) -> {
+                            if (which == 0) {
+                                startRoutingServiceToSavedPoint(index);
+                            } else if (which == 1) {
+                                addSavedPointAsWaypoint(index);
+                            } else if (which == 2) {
+                                useSavedPointAsStart(index);
+                            } else if (which == 3) {
+                                showRenameSavedPointDialog(index);
+                            } else {
+                                deleteSavedPoint(index);
+                            }
+                        })
+                .setNegativeButton("Annulla", null)
+                .show();
+    }
+
+    private void showSavedPointRenameDelete(int index) {
+        if (index < 0 || index >= savedPoints.size()) return;
+        SavedPoint p = savedPoints.get(index);
+        new AlertDialog.Builder(this)
+                .setTitle(p.name)
+                .setItems(new String[]{"Rinomina", "Elimina"}, (dialog, which) -> {
+                    if (which == 0) showRenameSavedPointDialog(index);
+                    else deleteSavedPoint(index);
+                })
+                .setNegativeButton("Annulla", null)
+                .show();
+    }
+
+    private void showRenameSavedPointDialog(int index) {
+        if (index < 0 || index >= savedPoints.size()) return;
+        SavedPoint p = savedPoints.get(index);
+        EditText nameEdit = new EditText(this);
+        nameEdit.setText(p.name);
+        nameEdit.setSelection(nameEdit.getText().length());
+
+        new AlertDialog.Builder(this)
+                .setTitle("Rinomina punto")
+                .setView(nameEdit)
+                .setNegativeButton("Annulla", null)
+                .setPositiveButton("Salva", (dialog, which) -> {
+                    String name = nameEdit.getText().toString().trim();
+                    if (name.isEmpty()) return;
+                    savedPoints.get(index).name = name;
+                    persistSavedPoints();
+                    refreshSavedPointsUi();
+                    status.setText("Punto rinominato: " + name);
+                })
+                .show();
+    }
+
+    private void deleteSavedPoint(int index) {
+        if (index < 0 || index >= savedPoints.size()) return;
+        String name = savedPoints.get(index).name;
+        savedPoints.remove(index);
+        persistSavedPoints();
+        refreshSavedPointsUi();
+        status.setText("Punto eliminato: " + name);
+    }
+
+    private void addSavedPointAsWaypoint(int index) {
+        if (index < 0 || index >= savedPoints.size()) return;
+        SavedPoint p = savedPoints.get(index);
+        GeoPoint gp = new GeoPoint(p.lat, p.lon);
+
+        if (selectedRoutePoints.size() < 2) {
+            selectedRoutePoints.add(gp);
+            lastSelectedPointIndex = selectedRoutePoints.size() - 1;
+        } else {
+            int insertAt = selectedRoutePoints.size() - 1;
+            selectedRoutePoints.add(insertAt, gp);
+            lastSelectedPointIndex = insertAt;
+        }
+
+        redrawSelectedRoutePoints();
+        zoomMapTo(selectedRoutePoints);
+        status.setText(p.name + " aggiunto al tragitto.");
+    }
+
+    private void useSavedPointAsStart(int index) {
+        if (index < 0 || index >= savedPoints.size()) return;
+        SavedPoint p = savedPoints.get(index);
+        GeoPoint gp = new GeoPoint(p.lat, p.lon);
+        if (selectedRoutePoints.isEmpty()) selectedRoutePoints.add(gp);
+        else selectedRoutePoints.set(0, gp);
+        lastSelectedPointIndex = 0;
+        redrawSelectedRoutePoints();
+        zoomMapTo(selectedRoutePoints);
+        status.setText("Partenza impostata: " + p.name);
+    }
+
+    private void startRoutingServiceToSavedPoint(int index) {
+        if (index < 0 || index >= savedPoints.size()) return;
+        SavedPoint p = savedPoints.get(index);
+
+        if (!validateNavigationPrerequisites(false)) return;
+
+        clearSelectedRoutePoints(false);
+        destinationEdit.setText(p.name);
+        savePrefs();
+
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_NAV_SOURCE, "point")
+                .putString(PREF_NAV_TARGET_LAT, Double.toString(p.lat))
+                .putString(PREF_NAV_TARGET_LON, Double.toString(p.lon))
+                .putString(PREF_NAV_TARGET_LABEL, p.name)
+                .putString(PREF_NAV_ROUTE_POINTS, "[]")
+                .apply();
+
+        launchNavigationService();
+        status.setText("Navigazione verso " + p.name + " dalla posizione attuale.");
+    }
+
+    private void loadSavedRoutes() {
+        savedRoutes.clear();
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_SAVED_ROUTES, "[]");
+        try {
+            JSONArray a = new JSONArray(raw);
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i);
+                if (o == null) continue;
+                String name = o.optString("name", "").trim();
+                JSONArray pts = o.optJSONArray("points");
+                if (name.isEmpty() || pts == null || pts.length() < 2) continue;
+
+                ArrayList<GeoPoint> routePoints = new ArrayList<>();
+                for (int j = 0; j < pts.length(); j++) {
+                    JSONObject po = pts.optJSONObject(j);
+                    if (po == null) continue;
+                    double lat = po.optDouble("lat", Double.NaN);
+                    double lon = po.optDouble("lon", Double.NaN);
+                    if (!Double.isNaN(lat) && !Double.isNaN(lon)) routePoints.add(new GeoPoint(lat, lon));
+                }
+                if (routePoints.size() >= 2) savedRoutes.add(new SavedRoute(name, routePoints));
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void persistSavedRoutes() {
+        JSONArray a = new JSONArray();
+        try {
+            for (SavedRoute r : savedRoutes) {
+                JSONObject o = new JSONObject();
+                o.put("name", r.name);
+                JSONArray pts = new JSONArray();
+                for (GeoPoint p : r.points) {
+                    JSONObject po = new JSONObject();
+                    po.put("lat", p.getLatitude());
+                    po.put("lon", p.getLongitude());
+                    pts.put(po);
+                }
+                o.put("points", pts);
+                a.put(o);
+            }
+        } catch (Exception ignored) {
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(PREF_SAVED_ROUTES, a.toString())
+                .apply();
+    }
+
+    private void refreshSavedRoutesUi() {
+        if (savedRoutesContainer == null) return;
+        savedRoutesContainer.removeAllViews();
+
+        if (savedRoutes.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("Nessun tragitto salvato");
+            empty.setTextSize(13);
+            savedRoutesContainer.addView(empty);
+            return;
+        }
+
+        for (int i = 0; i < savedRoutes.size(); i++) {
+            final int index = i;
+            SavedRoute r = savedRoutes.get(i);
+            Button b = new Button(this);
+            b.setAllCaps(false);
+            int waypointCount = Math.max(0, r.points.size() - 2);
+            b.setText("↝ " + r.name + " (" + waypointCount + " waypoint)");
+            b.setOnClickListener(v -> loadSavedRoute(index, true));
+            b.setOnLongClickListener(v -> {
+                showSavedRouteActions(index);
+                return true;
+            });
+            savedRoutesContainer.addView(b);
+        }
+    }
+
+    private void showSaveRouteDialog() {
+        if (selectedRoutePoints.size() < 2) {
+            status.setText("Seleziona almeno partenza e arrivo prima di salvare il tragitto.");
+            return;
+        }
+
+        EditText nameEdit = new EditText(this);
+        nameEdit.setHint("Nome, es. Giro collinare");
+
+        new AlertDialog.Builder(this)
+                .setTitle("Salva tragitto")
+                .setMessage("Salvo partenza, arrivo e tutti i waypoint nell'ordine attuale.")
+                .setView(nameEdit)
+                .setNegativeButton("Annulla", null)
+                .setPositiveButton("Salva", (dialog, which) -> {
+                    String name = nameEdit.getText().toString().trim();
+                    if (name.isEmpty()) name = "Tragitto " + (savedRoutes.size() + 1);
+
+                    ArrayList<GeoPoint> copy = copyGeoPoints(selectedRoutePoints);
+                    int existing = -1;
+                    for (int i = 0; i < savedRoutes.size(); i++) {
+                        if (savedRoutes.get(i).name.equalsIgnoreCase(name)) {
+                            existing = i;
+                            break;
+                        }
+                    }
+                    if (existing >= 0) savedRoutes.set(existing, new SavedRoute(name, copy));
+                    else savedRoutes.add(new SavedRoute(name, copy));
+
+                    persistSavedRoutes();
+                    refreshSavedRoutesUi();
+                    status.setText("Tragitto salvato: " + name);
+                })
+                .show();
+    }
+
+    private void loadSavedRoute(int index, boolean calculatePreview) {
+        if (index < 0 || index >= savedRoutes.size()) return;
+        SavedRoute r = savedRoutes.get(index);
+        selectedRoutePoints.clear();
+        selectedRoutePoints.addAll(copyGeoPoints(r.points));
+        lastSelectedPointIndex = selectedRoutePoints.size() - 1;
+        redrawSelectedRoutePoints();
+        zoomMapTo(selectedRoutePoints);
+        status.setText("Tragitto caricato: " + r.name);
+
+        if (calculatePreview) {
+            String key = apiKeyEdit.getText().toString().trim();
+            if (key.length() >= 8) fetchAndDrawPreviewFromSelectedPoints(key);
+        }
+    }
+
+    private void showSavedRouteActions(int index) {
+        if (index < 0 || index >= savedRoutes.size()) return;
+        SavedRoute r = savedRoutes.get(index);
+        new AlertDialog.Builder(this)
+                .setTitle(r.name)
+                .setItems(new String[]{"Carica", "Avvia tragitto", "Rinomina", "Elimina"}, (dialog, which) -> {
+                    if (which == 0) {
+                        loadSavedRoute(index, true);
+                    } else if (which == 1) {
+                        loadSavedRoute(index, false);
+                        startRoutingService();
+                    } else if (which == 2) {
+                        showRenameSavedRouteDialog(index);
+                    } else {
+                        deleteSavedRoute(index);
+                    }
+                })
+                .setNegativeButton("Annulla", null)
+                .show();
+    }
+
+    private void showRenameSavedRouteDialog(int index) {
+        if (index < 0 || index >= savedRoutes.size()) return;
+        SavedRoute r = savedRoutes.get(index);
+        EditText nameEdit = new EditText(this);
+        nameEdit.setText(r.name);
+        nameEdit.setSelection(nameEdit.getText().length());
+
+        new AlertDialog.Builder(this)
+                .setTitle("Rinomina tragitto")
+                .setView(nameEdit)
+                .setNegativeButton("Annulla", null)
+                .setPositiveButton("Salva", (dialog, which) -> {
+                    String name = nameEdit.getText().toString().trim();
+                    if (name.isEmpty()) return;
+                    savedRoutes.get(index).name = name;
+                    persistSavedRoutes();
+                    refreshSavedRoutesUi();
+                    status.setText("Tragitto rinominato: " + name);
+                })
+                .show();
+    }
+
+    private void deleteSavedRoute(int index) {
+        if (index < 0 || index >= savedRoutes.size()) return;
+        String name = savedRoutes.get(index).name;
+        savedRoutes.remove(index);
+        persistSavedRoutes();
+        refreshSavedRoutesUi();
+        status.setText("Tragitto eliminato: " + name);
+    }
+
+    private ArrayList<GeoPoint> copyGeoPoints(ArrayList<GeoPoint> source) {
+        ArrayList<GeoPoint> copy = new ArrayList<>();
+        for (GeoPoint p : source) copy.add(new GeoPoint(p.getLatitude(), p.getLongitude()));
+        return copy;
+    }
+
+    private String serializeGeoPoints(ArrayList<GeoPoint> points) {
+        JSONArray a = new JSONArray();
+        try {
+            for (GeoPoint p : points) {
+                JSONObject o = new JSONObject();
+                o.put("lat", p.getLatitude());
+                o.put("lon", p.getLongitude());
+                a.put(o);
+            }
+        } catch (Exception ignored) {
+        }
+        return a.toString();
+    }
+
+    private void clearSelectedRoutePoints(boolean updateStatus) {
+        selectedRoutePoints.clear();
+        lastSelectedPointIndex = -1;
+        redrawSelectedRoutePoints();
+        if (updateStatus) status.setText("Punti del tragitto cancellati.");
+    }
+
+    private boolean validateNavigationPrerequisites(boolean requireTextDestination) {
+        savePrefs();
+
+        if (apiKeyEdit.getText().toString().trim().length() < 8) {
+            status.setText("Inserisci API key OpenRouteService.");
+            return false;
+        }
+
+        if (requireTextDestination && destinationEdit.getText().toString().trim().length() < 3) {
+            status.setText("Inserisci una destinazione.");
+            return false;
+        }
+
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            status.setText("Concedi il permesso posizione.");
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 5);
+            return false;
+        }
+
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 6);
+        }
+        return true;
+    }
+
+    private void launchNavigationService() {
+        Intent i = new Intent(this, NavigationService.class);
+        i.setAction(NavigationService.ACTION_START);
+
+        if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+        else startService(i);
+    }
+
+    private static double distanceMetersLocal(double la1, double lo1, double la2, double lo2) {
+        double r = 6371000.0;
+        double p1 = Math.toRadians(la1);
+        double p2 = Math.toRadians(la2);
+        double dp = Math.toRadians(la2 - la1);
+        double dl = Math.toRadians(lo2 - lo1);
+        double a = Math.sin(dp / 2) * Math.sin(dp / 2) +
+                Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
+        return r * 2.0 * Math.atan2(Math.sqrt(a), Math.sqrt(1.0 - a));
     }
 
     private void updateRouteModeButtons() {
@@ -561,6 +1095,7 @@ public class MainActivity extends Activity {
     private void addSelectedRoutePoint(GeoPoint p) {
         GeoPoint point = new GeoPoint(p.getLatitude(), p.getLongitude());
         selectedRoutePoints.add(point);
+        lastSelectedPointIndex = selectedRoutePoints.size() - 1;
 
         redrawSelectedRoutePoints();
 
@@ -615,6 +1150,11 @@ public class MainActivity extends Activity {
         }
 
         selectedRoutePoints.remove(index);
+        if (selectedRoutePoints.isEmpty()) {
+            lastSelectedPointIndex = -1;
+        } else {
+            lastSelectedPointIndex = Math.min(index, selectedRoutePoints.size() - 1);
+        }
         redrawSelectedRoutePoints();
 
         int count = selectedRoutePoints.size();
@@ -964,39 +1504,34 @@ public class MainActivity extends Activity {
     }
 
     private void startRoutingService() {
-        savePrefs();
+        boolean hasRoutePoints = selectedRoutePoints.size() >= 2;
+        if (!validateNavigationPrerequisites(!hasRoutePoints)) return;
 
-        if (apiKeyEdit.getText().toString().trim().length() < 8) {
-            status.setText("Inserisci API key OpenRouteService.");
-            return;
-        }
-
-        if (destinationEdit.getText().toString().trim().length() < 3) {
-            status.setText("Inserisci una destinazione.");
-            return;
-        }
-
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            status.setText("Concedi il permesso posizione.");
-            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 5);
-            return;
-        }
-
-        if (android.os.Build.VERSION.SDK_INT >= 33 &&
-                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 6);
-        }
-
-        Intent i = new Intent(this, NavigationService.class);
-        i.setAction(NavigationService.ACTION_START);
-
-        if (android.os.Build.VERSION.SDK_INT >= 26) {
-            startForegroundService(i);
+        SharedPreferences.Editor e = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
+        if (hasRoutePoints) {
+            e.putString(PREF_NAV_SOURCE, "route")
+                    .putString(PREF_NAV_ROUTE_POINTS, serializeGeoPoints(selectedRoutePoints))
+                    .putString(PREF_NAV_TARGET_LABEL, "Tragitto con waypoint")
+                    .putString(PREF_NAV_TARGET_LAT, "")
+                    .putString(PREF_NAV_TARGET_LON, "");
         } else {
-            startService(i);
+            e.putString(PREF_NAV_SOURCE, "text")
+                    .putString(PREF_NAV_ROUTE_POINTS, "[]")
+                    .putString(PREF_NAV_TARGET_LABEL, "")
+                    .putString(PREF_NAV_TARGET_LAT, "")
+                    .putString(PREF_NAV_TARGET_LON, "");
         }
+        e.apply();
 
-        status.setText("Navigazione avviata. Ora puoi spegnere lo schermo: deve restare la notifica Ciao Beeline.");
+        launchNavigationService();
+
+        if (hasRoutePoints) {
+            int waypointCount = Math.max(0, selectedRoutePoints.size() - 2);
+            status.setText("Navigazione avviata sul tragitto selezionato con " + waypointCount +
+                    (waypointCount == 1 ? " waypoint." : " waypoint."));
+        } else {
+            status.setText("Navigazione avviata. Ora puoi spegnere lo schermo: deve restare la notifica Ciao Beeline.");
+        }
     }
 
     private void stopRoutingService() {
@@ -1026,6 +1561,28 @@ public class MainActivity extends Activity {
         Favorite(String name, String address) {
             this.name = name;
             this.address = address;
+        }
+    }
+
+    private static class SavedPoint {
+        String name;
+        double lat;
+        double lon;
+
+        SavedPoint(String name, double lat, double lon) {
+            this.name = name;
+            this.lat = lat;
+            this.lon = lon;
+        }
+    }
+
+    private static class SavedRoute {
+        String name;
+        final ArrayList<GeoPoint> points;
+
+        SavedRoute(String name, ArrayList<GeoPoint> points) {
+            this.name = name;
+            this.points = points;
         }
     }
 
