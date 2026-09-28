@@ -8,6 +8,7 @@ import android.graphics.Path;
 import android.graphics.PointF;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.view.MotionEvent;
 import android.view.View;
 
 import org.json.JSONObject;
@@ -64,6 +65,26 @@ public class NavView extends View {
     private float displaySpeed = speed;
     private boolean animating = false;
 
+    // V0.22 route browsing on the watch:
+    // swipe up = look farther ahead, swipe down = return toward the live position.
+    // The phone still sends only the local high-detail look-ahead geometry; we do not
+    // request or cache the entire trip on the Carlyle.
+    private static final float BROWSE_TOUCH_SLOP = 10f;
+    private static final long BROWSE_AUTO_RETURN_MS = 5000L;
+    private float browseOffsetPx = 0f;
+    private boolean browsingRoute = false;
+    private float touchDownX = 0f;
+    private float touchDownY = 0f;
+    private float lastTouchY = 0f;
+    private boolean touchDragging = false;
+
+    private final Runnable browseAutoReturn = new Runnable() {
+        @Override
+        public void run() {
+            resetBrowseMode();
+        }
+    };
+
     public NavView(Context context) {
         super(context);
         setKeepScreenOn(true);
@@ -85,8 +106,8 @@ public class NavView extends View {
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
         roadPaint.setStyle(Paint.Style.STROKE);
-        roadPaint.setColor(Color.rgb(68, 68, 68));
-        roadPaint.setStrokeWidth(3.6f);
+        roadPaint.setColor(Color.rgb(82, 82, 82));
+        roadPaint.setStrokeWidth(4.2f);
         roadPaint.setStrokeCap(Paint.Cap.ROUND);
         roadPaint.setStrokeJoin(Paint.Join.ROUND);
 
@@ -128,6 +149,10 @@ public class NavView extends View {
             limit = o.optInt("limit", limit);
             roundaboutExit = o.optInt("exit", roundaboutExit);
 
+            if ("WAIT".equals(mode) || "STOP".equals(mode)) {
+                resetBrowseMode();
+            }
+
             if (o.has("progress")) {
                 progress = (float) o.optDouble("progress", progress);
                 if (progress >= 0f) progress = clamp(progress, 0f, 1f);
@@ -146,6 +171,7 @@ public class NavView extends View {
                     targetPts.addAll(parsed);
                     displayPts.clear();
                     displayPts.addAll(copyPoints(parsed));
+                    clampBrowseOffsetToRoute();
                 }
             }
 
@@ -208,6 +234,164 @@ public class NavView extends View {
     }
 
     @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        // Keep View's normal touch handling active so the existing long-press demo
+        // configured by MainActivity continues to work.
+        super.onTouchEvent(event);
+
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                touchDownX = event.getX();
+                touchDownY = event.getY();
+                lastTouchY = touchDownY;
+                touchDragging = false;
+                return true;
+
+            case MotionEvent.ACTION_MOVE:
+                if (!isBrowsableMode()) return true;
+
+                float totalDy = event.getY() - touchDownY;
+                if (!touchDragging && Math.abs(totalDy) >= logicalPx(BROWSE_TOUCH_SLOP)) {
+                    touchDragging = true;
+                    cancelLongPress();
+                    setPressed(false);
+                }
+
+                if (touchDragging) {
+                    float dyScreen = event.getY() - lastTouchY;
+                    float dyLogical = screenToLogical(dyScreen);
+
+                    // Finger upward (negative dy) advances along the route.
+                    browseOffsetPx -= dyLogical;
+                    browsingRoute = browseOffsetPx > 0.5f || browsingRoute;
+                    clampBrowseOffsetToRoute();
+                    scheduleBrowseAutoReturn();
+                    invalidate();
+                }
+
+                lastTouchY = event.getY();
+                return true;
+
+            case MotionEvent.ACTION_UP:
+                if (touchDragging) {
+                    scheduleBrowseAutoReturn();
+                } else if (browsingRoute && isTapNearCenter(event.getX(), event.getY())) {
+                    // A quick tap near the centre returns immediately to live GPS.
+                    resetBrowseMode();
+                }
+                touchDragging = false;
+                return true;
+
+            case MotionEvent.ACTION_CANCEL:
+                touchDragging = false;
+                return true;
+        }
+
+        return true;
+    }
+
+    private boolean isBrowsableMode() {
+        return "NAV".equals(mode) || "REROUTE".equals(mode) || "OFF_ROUTE".equals(mode);
+    }
+
+    private float logicalPx(float px) {
+        float scale = Math.min(getWidth(), getHeight()) / W;
+        if (scale <= 0f) return px;
+        return px * scale;
+    }
+
+    private float screenToLogical(float deltaPx) {
+        float scale = Math.min(getWidth(), getHeight()) / W;
+        if (scale <= 0f) return deltaPx;
+        return deltaPx / scale;
+    }
+
+    private boolean isTapNearCenter(float x, float y) {
+        float scale = Math.min(getWidth(), getHeight()) / W;
+        if (scale <= 0f) scale = 1f;
+        float logicalX = (x - (getWidth() - W * scale) / 2f) / scale;
+        float logicalY = (y - (getHeight() - H * scale) / 2f) / scale;
+        float dx = logicalX - 120f;
+        float dy = logicalY - 120f;
+        return dx * dx + dy * dy <= 52f * 52f;
+    }
+
+    private void scheduleBrowseAutoReturn() {
+        removeCallbacks(browseAutoReturn);
+        postDelayed(browseAutoReturn, BROWSE_AUTO_RETURN_MS);
+    }
+
+    private void resetBrowseMode() {
+        removeCallbacks(browseAutoReturn);
+        browseOffsetPx = 0f;
+        browsingRoute = false;
+        invalidate();
+    }
+
+    private void clampBrowseOffsetToRoute() {
+        ArrayList<PointF> pts = displayPts.isEmpty() ? targetPts : displayPts;
+        float max = Math.max(0f, polylineLength(pts) - 1f);
+        browseOffsetPx = clamp(browseOffsetPx, 0f, max);
+        if (browseOffsetPx <= 0.5f) {
+            browseOffsetPx = 0f;
+            browsingRoute = false;
+        }
+    }
+
+    private float polylineLength(ArrayList<PointF> pts) {
+        float total = 0f;
+        for (int i = 1; i < pts.size(); i++) {
+            float dx = pts.get(i).x - pts.get(i - 1).x;
+            float dy = pts.get(i).y - pts.get(i - 1).y;
+            total += (float) Math.hypot(dx, dy);
+        }
+        return total;
+    }
+
+    private PointF pointAtDistance(ArrayList<PointF> pts, float distancePx) {
+        if (pts.isEmpty()) return new PointF(MARKER_X, MARKER_Y);
+        if (distancePx <= 0f) return new PointF(pts.get(0).x, pts.get(0).y);
+
+        float remaining = distancePx;
+        for (int i = 1; i < pts.size(); i++) {
+            PointF a = pts.get(i - 1);
+            PointF b = pts.get(i);
+            float dx = b.x - a.x;
+            float dy = b.y - a.y;
+            float len = (float) Math.hypot(dx, dy);
+            if (len <= 0.0001f) continue;
+
+            if (remaining <= len) {
+                float t = remaining / len;
+                return new PointF(a.x + dx * t, a.y + dy * t);
+            }
+            remaining -= len;
+        }
+
+        PointF last = pts.get(pts.size() - 1);
+        return new PointF(last.x, last.y);
+    }
+
+    private ArrayList<PointF> applyBrowsePan(ArrayList<PointF> pts) {
+        if (!browsingRoute || browseOffsetPx <= 0f || pts.isEmpty()) return pts;
+
+        PointF anchor = pointAtDistance(pts, browseOffsetPx);
+        float dx = MARKER_X - anchor.x;
+        float dy = MARKER_Y - anchor.y;
+
+        ArrayList<PointF> shifted = new ArrayList<>();
+        for (PointF p : pts) shifted.add(new PointF(p.x + dx, p.y + dy));
+        return shifted;
+    }
+
+    private int browseMeters() {
+        // Same scale used by NavigationService v0.21/v0.22: 1.00 px/m normally,
+        // 1.28 px/m near a roundabout. This is only a preview distance label.
+        float ppm = ("ROUND".equals(turn) && displayDist >= 0f && displayDist <= 140f) ? 1.28f : 1.00f;
+        return Math.max(0, Math.round(browseOffsetPx / ppm));
+    }
+
+    @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
 
@@ -247,6 +431,7 @@ public class NavView extends View {
         ArrayList<PointF> pts = displayPts.isEmpty()
                 ? normalizedRoute(parseLine(line))
                 : copyPoints(displayPts);
+        pts = applyBrowsePan(pts);
 
         drawRoute(c, pts);
         drawPositionMarker(c);
@@ -254,6 +439,10 @@ public class NavView extends View {
         drawTopGuidance(c);
         drawBottomStatus(c);
         drawProgress(c);
+
+        if (browsingRoute) {
+            drawBrowseBadge(c);
+        }
 
         if ("REROUTE".equals(mode)) {
             drawRerouteBadge(c);
@@ -283,14 +472,30 @@ public class NavView extends View {
     private void drawContextRoads(Canvas c) {
         if (roads == null || roads.trim().isEmpty()) return;
 
+        PointF browseDelta = getBrowseTranslation();
         String[] polylines = roads.split("\\|");
         for (String polyline : polylines) {
             ArrayList<PointF> pts = normalizedContext(parseLine(polyline));
             if (pts.size() < 2) continue;
 
+            if (browseDelta.x != 0f || browseDelta.y != 0f) {
+                for (PointF p : pts) {
+                    p.x += browseDelta.x;
+                    p.y += browseDelta.y;
+                }
+            }
+
             Path p = exactPath(pts);
             c.drawPath(p, roadPaint);
         }
+    }
+
+    private PointF getBrowseTranslation() {
+        if (!browsingRoute || browseOffsetPx <= 0f) return new PointF(0f, 0f);
+        ArrayList<PointF> routePts = displayPts.isEmpty() ? targetPts : displayPts;
+        if (routePts.isEmpty()) return new PointF(0f, 0f);
+        PointF anchor = pointAtDistance(routePts, browseOffsetPx);
+        return new PointF(MARKER_X - anchor.x, MARKER_Y - anchor.y);
     }
 
     /**
@@ -401,6 +606,12 @@ public class NavView extends View {
             return;
         }
 
+        if ("UTURN".equals(t)) {
+            RectF r = new RectF(cx - 7f, cy - 8f, cx + 7f, cy + 6f);
+            c.drawArc(r, -70f, -230f, false, p);
+            return;
+        }
+
         Path path = new Path();
         if ("LEFT".equals(t)) {
             path.moveTo(cx + 6f, cy + 7f);
@@ -446,6 +657,14 @@ public class NavView extends View {
                 textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
                 c.drawText(String.valueOf(roundaboutExit), cx, cy + 3.5f * scale, textPaint);
             }
+            return;
+        }
+
+        if ("UTURN".equals(t)) {
+            float r = 11f * scale;
+            RectF rr = new RectF(cx - r, cy - r, cx + r, cy + r);
+            c.drawArc(rr, -70f, -235f, false, ip);
+            drawArrowHead(c, cx - 9f * scale, cy + 6f * scale, 110f, ip, 6.5f * scale);
             return;
         }
 
@@ -525,6 +744,22 @@ public class NavView extends View {
         textPaint.setColor(Color.WHITE);
     }
 
+    private void drawBrowseBadge(Canvas c) {
+        Paint pill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        pill.setColor(Color.rgb(30, 30, 30));
+        pill.setStyle(Paint.Style.FILL);
+
+        String label = "+" + browseMeters() + " m";
+        RectF r = new RectF(87f, 75f, 153f, 98f);
+        c.drawRoundRect(r, 11.5f, 11.5f, pill);
+
+        textPaint.setColor(Color.WHITE);
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextSize(11f);
+        c.drawText(label, 120f, 90f, textPaint);
+    }
+
     private void drawRerouteBadge(Canvas c) {
         Paint pill = new Paint(Paint.ANTI_ALIAS_FLAG);
         pill.setColor(Color.rgb(35, 35, 35));
@@ -584,6 +819,7 @@ public class NavView extends View {
         ArrayList<PointF> pts = displayPts.isEmpty()
                 ? normalizedRoute(parseLine(line))
                 : copyPoints(displayPts);
+        pts = applyBrowsePan(pts);
 
         Paint faintShadow = new Paint(routeShadowPaint);
         faintShadow.setColor(Color.rgb(20, 20, 20));
@@ -595,6 +831,7 @@ public class NavView extends View {
         if (pts.size() >= 2) c.drawPath(exactPath(pts), faint);
 
         drawPositionMarker(c);
+        if (browsingRoute) drawBrowseBadge(c);
 
         Paint pill = new Paint(Paint.ANTI_ALIAS_FLAG);
         pill.setStyle(Paint.Style.FILL);
@@ -633,9 +870,10 @@ public class NavView extends View {
 
     private ArrayList<PointF> normalizedContext(ArrayList<PointF> src) {
         ArrayList<PointF> out = new ArrayList<>();
-        for (PointF p : src) {
-            out.add(new PointF(clamp(p.x, 8f, 232f), clamp(p.y, 58f, 190f)));
-        }
+        // Context roads are already projected by the phone in the same coordinate
+        // system as the white route. Do not clamp them: clamping would bend parallel
+        // roads and junction branches toward the circular edge.
+        for (PointF p : src) out.add(new PointF(p.x, p.y));
         return out;
     }
 
