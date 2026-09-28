@@ -57,8 +57,13 @@ public class NavigationService extends Service {
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
     private static final long HEARTBEAT_MS = 1000;
-    private static final double SCREEN_PIXELS_PER_METER = 0.82;
-    private static final double SCREEN_LOOKAHEAD_METERS = 260.0;
+    // V0.21: keep the ORS geometry dense enough to preserve roundabouts and tight bends.
+    // The base zoom is intentionally a little closer than V0.20; near a roundabout
+    // we zoom in further so the individual exits remain distinguishable on 240x240.
+    private static final double SCREEN_PIXELS_PER_METER = 1.00;
+    private static final double ROUNDABOUT_PIXELS_PER_METER = 1.28;
+    private static final double SCREEN_LOOKAHEAD_METERS = 230.0;
+    private static final int MAX_SCREEN_POINTS = 320;
 
     private LocationManager locationManager;
     private Location currentLocation;
@@ -416,8 +421,9 @@ public class NavigationService extends Service {
                     int type = step.optInt("type", -1);
                     double distance = step.optDouble("distance", 0);
                     String instruction = step.optString("instruction", "");
+                    int exitNumber = step.optInt("exit_number", -1);
 
-                    newManeuvers.add(new Maneuver(startIndex, endIndex, type, distance, instruction));
+                    newManeuvers.add(new Maneuver(startIndex, endIndex, type, distance, instruction, exitNumber));
                 }
             }
         }
@@ -448,20 +454,26 @@ public class NavigationService extends Service {
 
         float speedKmh = Math.max(0, currentLocation.getSpeed() * 3.6f);
         requestSpeedLimitIfNeeded(currentLocation);
-        String line = buildScreenLine(copy, match, currentLocation);
 
         Maneuver next = nextManeuver(manCopy, nearest);
         String turn;
         int dist;
+        int roundaboutExit = -1;
 
         if (next != null) {
             turn = turnFromOpenRouteType(next.type, next.instruction);
             dist = distanceAlongRoute(copy, nearest, next.endIndex);
             if (dist < 0) dist = (int) Math.round(next.distance);
+            if ("ROUND".equals(turn)) roundaboutExit = next.exitNumber;
         } else {
             turn = inferTurn(copy, nearest);
             dist = distanceToNextBend(copy, nearest);
         }
+
+        // Build the display polyline only after the next maneuver is known.
+        // This allows a closer scale around roundabouts while still sending every
+        // ORS geometry point available inside the visible look-ahead window.
+        String line = buildScreenLine(copy, match, currentLocation, turn, dist);
 
         try {
             JSONObject o = new JSONObject();
@@ -472,6 +484,7 @@ public class NavigationService extends Service {
             o.put("dist", Math.max(0, Math.min(99999, dist)));
             o.put("turn", turn);
             o.put("limit", lastSpeedLimit);
+            o.put("exit", roundaboutExit);
             o.put("line", line);
 
             sendToWear(o.toString());
@@ -923,7 +936,7 @@ public class NavigationService extends Service {
         return (int) Math.min(99999, acc);
     }
 
-    private static String buildScreenLine(ArrayList<LatLon> pts, RouteMatch match, Location loc) {
+    private static String buildScreenLine(ArrayList<LatLon> pts, RouteMatch match, Location loc, String turn, int distToTurn) {
         int idx = Math.max(0, Math.min(match.index, pts.size() - 1));
 
         if (pts.size() < 2 || idx >= pts.size() - 1) {
@@ -931,13 +944,15 @@ public class NavigationService extends Service {
         }
 
         /*
-         * V0.20 faithful geometry:
-         * - use the real ORS polyline;
-         * - local metric projection (east/north) around the snapped rider position;
-         * - rotate the whole geometry heading-up;
-         * - never clamp every point to the screen edge (that was distorting curves
-         *   and especially roundabouts);
-         * - the round display clips naturally on the watch.
+         * V0.21 high-fidelity geometry:
+         * - use every ORS geometry point in the local look-ahead window;
+         * - no distance-based point thinning (V0.20 still skipped points < 1.8 m);
+         * - project lat/lon to local metric east/north coordinates;
+         * - rotate once into heading-up coordinates, without reshaping the path;
+         * - keep sub-pixel precision in the transmitted coordinates;
+         * - never clamp points to the round screen edge;
+         * - zoom in slightly when approaching a roundabout so its circle/exits are
+         *   readable instead of collapsing under the route stroke.
          */
         double lat0 = match.lat;
         double lon0 = match.lon;
@@ -945,8 +960,11 @@ public class NavigationService extends Service {
         double metersPerDegLat = 111320.0;
         double metersPerDegLon = Math.max(1.0, Math.cos(lat0Rad) * 111320.0);
 
-        LatLon next = pts.get(Math.min(idx + 1, pts.size() - 1));
-        double head = bearing(lat0, lon0, next.lat, next.lon);
+        // Use a short forward baseline for heading. A single next coordinate can be
+        // extremely close on dense geometry and cause unnecessary orientation jitter.
+        int headingEnd = Math.min(idx + 4, pts.size() - 1);
+        LatLon headingPoint = pts.get(headingEnd);
+        double head = bearing(lat0, lon0, headingPoint.lat, headingPoint.lon);
 
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
         if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
@@ -962,16 +980,19 @@ public class NavigationService extends Service {
         final double originX = 120.0;
         final double originY = 164.0;
 
-        StringBuilder sb = new StringBuilder();
+        double pixelsPerMeter = SCREEN_PIXELS_PER_METER;
+        if ("ROUND".equals(turn) && distToTurn >= 0 && distToTurn <= 140) {
+            pixelsPerMeter = ROUNDABOUT_PIXELS_PER_METER;
+        }
+
+        StringBuilder sb = new StringBuilder(4096);
         sb.append("120,164");
 
         int added = 1;
         double walked = 0.0;
         LatLon prev = new LatLon(lat0, lon0);
-        double lastAddedEast = 0.0;
-        double lastAddedNorth = 0.0;
 
-        for (int i = idx + 1; i < pts.size() && added < 90; i++) {
+        for (int i = idx + 1; i < pts.size() && added < MAX_SCREEN_POINTS; i++) {
             LatLon p = pts.get(i);
 
             walked += distanceMeters(prev.lat, prev.lon, p.lat, p.lon);
@@ -980,29 +1001,29 @@ public class NavigationService extends Service {
             double east = (p.lon - lon0) * metersPerDegLon;
             double north = (p.lat - lat0) * metersPerDegLat;
 
-            // Preserve small roundabout/curve details but avoid flooding the Data Layer.
-            double spacing = Math.hypot(east - lastAddedEast, north - lastAddedNorth);
-            if (spacing < 1.8 && i < pts.size() - 1) continue;
-
             // Heading-up: right is +x, forward is -y on the display.
             double right = east * cosH - north * sinH;
             double forward = east * sinH + north * cosH;
 
-            int sx = (int) Math.round(originX + right * SCREEN_PIXELS_PER_METER);
-            int sy = (int) Math.round(originY - forward * SCREEN_PIXELS_PER_METER);
+            double sx = originX + right * pixelsPerMeter;
+            double sy = originY - forward * pixelsPerMeter;
 
-            // Do NOT clamp sx/sy: clipping on the round watch preserves geometry.
-            sb.append(';').append(sx).append(',').append(sy);
+            // Keep one decimal place instead of integer-rounding every vertex. On a
+            // small roundabout this preserves visibly more of the original curvature.
+            appendScreenPoint(sb, sx, sy);
             added++;
 
-            lastAddedEast = east;
-            lastAddedNorth = north;
-
-            if (walked >= SCREEN_LOOKAHEAD_METERS && added > 10) break;
+            if (walked >= SCREEN_LOOKAHEAD_METERS && added > 12) break;
         }
 
         if (added < 2) sb.append(";120,90");
         return sb.toString();
+    }
+
+    private static void appendScreenPoint(StringBuilder sb, double x, double y) {
+        double rx = Math.round(x * 10.0) / 10.0;
+        double ry = Math.round(y * 10.0) / 10.0;
+        sb.append(';').append(rx).append(',').append(ry);
     }
 
 
@@ -1032,12 +1053,14 @@ public class NavigationService extends Service {
         int type;
         double distance;
         String instruction;
-        Maneuver(int startIndex, int endIndex, int type, double distance, String instruction) {
+        int exitNumber;
+        Maneuver(int startIndex, int endIndex, int type, double distance, String instruction, int exitNumber) {
             this.startIndex = startIndex;
             this.endIndex = endIndex;
             this.type = type;
             this.distance = distance;
             this.instruction = instruction;
+            this.exitNumber = exitNumber;
         }
     }
 
