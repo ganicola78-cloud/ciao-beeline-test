@@ -74,13 +74,13 @@ public class NavView extends View {
 
         routeShadowPaint.setStyle(Paint.Style.STROKE);
         routeShadowPaint.setColor(Color.rgb(24, 24, 24));
-        routeShadowPaint.setStrokeWidth(17f);
+        routeShadowPaint.setStrokeWidth(14f);
         routeShadowPaint.setStrokeCap(Paint.Cap.ROUND);
         routeShadowPaint.setStrokeJoin(Paint.Join.ROUND);
 
         routePaint.setStyle(Paint.Style.STROKE);
         routePaint.setColor(Color.WHITE);
-        routePaint.setStrokeWidth(9.5f);
+        routePaint.setStrokeWidth(8.0f);
         routePaint.setStrokeCap(Paint.Cap.ROUND);
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
@@ -327,14 +327,15 @@ public class NavView extends View {
     }
 
     private void drawTopGuidance(Canvas c) {
-        // Black translucent-looking plate made with opaque black, to keep route from crossing text.
+        // V0.21: lower the whole guidance block so the round display does not crop
+        // the turn/roundabout icon at the upper-left edge.
         Paint plate = new Paint(Paint.ANTI_ALIAS_FLAG);
         plate.setStyle(Paint.Style.FILL);
         plate.setColor(Color.BLACK);
-        RectF topPlate = new RectF(25f, 7f, 215f, 59f);
+        RectF topPlate = new RectF(25f, 15f, 215f, 70f);
         c.drawRoundRect(topPlate, 22f, 22f, plate);
 
-        drawTurnIcon(c, 52f, 34f, turn, 0.88f);
+        drawTurnIcon(c, 54f, 45f, turn, 0.92f);
 
         textPaint.setTextAlign(Paint.Align.RIGHT);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
@@ -343,20 +344,21 @@ public class NavView extends View {
         if (distanceText.endsWith(" m")) {
             String number = distanceText.substring(0, distanceText.length() - 2);
             textPaint.setTextSize(number.length() >= 4 ? 28f : 34f);
-            c.drawText(number, 181f, 43f, textPaint);
+            c.drawText(number, 181f, 54f, textPaint);
 
             mutedTextPaint.setTextAlign(Paint.Align.LEFT);
             mutedTextPaint.setTextSize(11f);
             mutedTextPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-            c.drawText("m", 186f, 42f, mutedTextPaint);
+            c.drawText("m", 186f, 53f, mutedTextPaint);
             mutedTextPaint.setTextAlign(Paint.Align.CENTER);
         } else {
             textPaint.setTextSize(distanceText.length() > 6 ? 24f : 28f);
-            c.drawText(distanceText, 204f, 43f, textPaint);
+            c.drawText(distanceText, 204f, 54f, textPaint);
         }
 
         textPaint.setTextAlign(Paint.Align.CENTER);
     }
+
 
     private void drawBottomStatus(Canvas c) {
         // A subtle separator helps the speed information stay readable over route geometry.
@@ -366,19 +368,19 @@ public class NavView extends View {
         int currentSpeed = Math.max(0, Math.round(displaySpeed));
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(21f);
-        c.drawText(String.valueOf(currentSpeed), 78f, 220f, textPaint);
+        textPaint.setTextSize(25f);
+        c.drawText(String.valueOf(currentSpeed), 78f, 221f, textPaint);
 
-        mutedTextPaint.setTextSize(7.5f);
+        mutedTextPaint.setTextSize(8.5f);
         mutedTextPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        c.drawText("km/h", 78f, 231f, mutedTextPaint);
+        c.drawText("km/h", 78f, 232f, mutedTextPaint);
 
         // Tiny centre cue: useful when route geometry is nearly straight.
         drawMiniDirectionCue(c, 120f, 218f, turn);
 
         // Legal speed limit, right side. If unknown, keep the UI balanced with a dash.
         if (limit > 0) {
-            drawSpeedLimit(c, 165f, 217f, 14.5f);
+            drawSpeedLimit(c, 165f, 217f, 17.5f);
         } else {
             mutedTextPaint.setTextSize(17f);
             c.drawText("—", 165f, 222f, mutedTextPaint);
@@ -511,15 +513,15 @@ public class NavView extends View {
         c.drawCircle(cx, cy, radius, p);
 
         p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(3.4f);
+        p.setStrokeWidth(3.8f);
         p.setColor(Color.rgb(220, 38, 38));
         c.drawCircle(cx, cy, radius - 1.6f, p);
 
         textPaint.setColor(Color.BLACK);
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        textPaint.setTextSize(limit >= 100 ? 9.5f : 11.5f);
-        c.drawText(String.valueOf(limit), cx, cy + 3.8f, textPaint);
+        textPaint.setTextSize(limit >= 100 ? 11.5f : 14.0f);
+        c.drawText(String.valueOf(limit), cx, cy + 4.7f, textPaint);
         textPaint.setColor(Color.WHITE);
     }
 
