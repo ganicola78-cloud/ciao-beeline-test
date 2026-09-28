@@ -57,6 +57,10 @@ public class NavigationService extends Service {
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
     private static final long HEARTBEAT_MS = 1000;
+    private static final long CONTEXT_ROADS_REFRESH_MS = 30000;
+    private static final long CONTEXT_ROADS_MIN_REFRESH_MS = 10000;
+    private static final double CONTEXT_ROADS_REFRESH_DISTANCE_M = 140.0;
+    private static final double CONTEXT_ROADS_QUERY_RADIUS_M = 300.0;
     // V0.21: keep the ORS geometry dense enough to preserve roundabouts and tight bends.
     // The base zoom is intentionally a little closer than V0.20; near a roundabout
     // we zoom in further so the individual exits remain distinguishable on 240x240.
@@ -71,6 +75,7 @@ public class NavigationService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ArrayList<LatLon> route = new ArrayList<>();
     private final ArrayList<Maneuver> maneuvers = new ArrayList<>();
+    private final ArrayList<ArrayList<LatLon>> contextRoads = new ArrayList<>();
 
     private boolean running = false;
     private boolean routeRequestInProgress = false;
@@ -80,6 +85,10 @@ public class NavigationService extends Service {
     private int lastSpeedLimit = -1;
     private long lastSpeedLimitMs = 0;
     private boolean speedLimitRequestInProgress = false;
+    private boolean contextRoadRequestInProgress = false;
+    private long lastContextRoadsMs = 0;
+    private double lastContextRoadsLat = Double.NaN;
+    private double lastContextRoadsLon = Double.NaN;
     private long navSeq = 0;
     private LatLon lastDestination = null;
     private String lastDestinationText = "";
@@ -120,7 +129,22 @@ public class NavigationService extends Service {
                 if (empty) {
                     requestRoute(false);
                 } else {
-                    sendNavUpdate(false);
+                    // Important on Redmi/MIUI: when the display is off, GPS callbacks can
+                    // become less frequent even though the foreground service is alive.
+                    // The heartbeat therefore performs the same off-route/reroute decision
+                    // as a real LocationListener callback instead of merely repainting the
+                    // old route. This fixes reroutes that only appeared after unlocking.
+                    updateOffRouteDistance();
+                    long now = System.currentTimeMillis();
+                    boolean offRoute = offRouteMeters > OFF_ROUTE_RECALC_METERS;
+                    boolean cooldownPassed = now - lastRouteMs > RECALC_COOLDOWN_MS;
+                    boolean periodicRefresh = now - lastRouteMs > PERIODIC_RECALC_MS;
+
+                    if ((offRoute && cooldownPassed) || periodicRefresh) {
+                        requestRoute(true);
+                    } else {
+                        sendNavUpdate(false);
+                    }
                 }
             }
 
@@ -184,6 +208,11 @@ public class NavigationService extends Service {
         lastSpeedLimit = -1;
         lastSpeedLimitMs = 0;
         speedLimitRequestInProgress = false;
+        contextRoadRequestInProgress = false;
+        lastContextRoadsMs = 0;
+        lastContextRoadsLat = Double.NaN;
+        lastContextRoadsLon = Double.NaN;
+        synchronized (contextRoads) { contextRoads.clear(); }
 
         try {
             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
@@ -461,8 +490,11 @@ public class NavigationService extends Service {
         int roundaboutExit = -1;
 
         if (next != null) {
-            turn = turnFromOpenRouteType(next.type, next.instruction);
-            dist = distanceAlongRoute(copy, nearest, next.endIndex);
+            // ORS step instructions describe the maneuver at way_points[0] (the
+            // beginning of the step), not at way_points[1]. The older code measured
+            // to endIndex and could keep the previous arrow visible for kilometres.
+            turn = validatedTurnForManeuver(copy, next);
+            dist = distanceAlongRoute(copy, nearest, next.startIndex);
             if (dist < 0) dist = (int) Math.round(next.distance);
             if ("ROUND".equals(turn)) roundaboutExit = next.exitNumber;
         } else {
@@ -470,10 +502,15 @@ public class NavigationService extends Service {
             dist = distanceToNextBend(copy, nearest);
         }
 
+        // Nearby OSM road context is mainly useful around junctions/ramps. Start
+        // refreshing it when the next manoeuvre is within roughly 1.2 km.
+        if (dist <= 1200) requestContextRoadsIfNeeded(currentLocation);
+
         // Build the display polyline only after the next maneuver is known.
         // This allows a closer scale around roundabouts while still sending every
         // ORS geometry point available inside the visible look-ahead window.
         String line = buildScreenLine(copy, match, currentLocation, turn, dist);
+        String roads = buildScreenRoads(copy, match, currentLocation, turn, dist);
 
         try {
             JSONObject o = new JSONObject();
@@ -486,6 +523,7 @@ public class NavigationService extends Service {
             o.put("limit", lastSpeedLimit);
             o.put("exit", roundaboutExit);
             o.put("line", line);
+            o.put("roads", roads);
 
             sendToWear(o.toString());
             updateNotification(offRouteMeters > OFF_ROUTE_WARN_METERS ? "Fuori rotta" : "Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
@@ -495,48 +533,67 @@ public class NavigationService extends Service {
     private Maneuver nextManeuver(ArrayList<Maneuver> list, int nearestRouteIndex) {
         if (list.isEmpty()) return null;
 
-        Maneuver fallback = null;
+        Maneuver straightFallback = null;
 
         for (Maneuver m : list) {
-            if (m.endIndex <= nearestRouteIndex + 1) continue;
+            // The instruction belongs to the START of this ORS step. Keep it visible
+            // for a couple of dense geometry vertices around the junction, then move on.
+            if (m.startIndex + 2 < nearestRouteIndex) continue;
 
-            // 10 = destinazione/arrivo, 11 = partenza/depart.
+            // 10 = goal, 11 = depart.
             if (m.type == 10 || m.type == 11) continue;
 
-            String instr = m.instruction == null ? "" : m.instruction.toLowerCase();
-
-            // Le rotatorie hanno priorità perché su ORS a volte arrivano come enter/exit
-            // o con testo "roundabout/rotatoria".
-            if (m.type == 7 || m.type == 8 || instr.contains("roundabout") || instr.contains("rotatoria")) {
-                return m;
-            }
-
-            // Evita di mostrare "STRAIGHT" lontani quando c'è una vera manovra dopo.
+            // A straight instruction is useful only if there is no actual manoeuvre
+            // ahead. Prefer the first real turn/keep/roundabout/U-turn.
             if (m.type == 6) {
-                if (fallback == null) fallback = m;
+                if (straightFallback == null) straightFallback = m;
                 continue;
             }
 
             return m;
         }
 
-        return fallback;
+        return straightFallback;
     }
 
     private String turnFromOpenRouteType(int type, String instruction) {
         String instr = instruction == null ? "" : instruction.toLowerCase();
 
+        // Current ORS instruction encoding:
+        // 0 left, 1 right, 2 sharp left, 3 sharp right,
+        // 4 slight left, 5 slight right, 6 straight,
+        // 7 enter roundabout, 8 exit roundabout, 9 U-turn,
+        // 10 goal, 11 depart, 12 keep left, 13 keep right.
         if (type == 7 || type == 8 || instr.contains("roundabout") || instr.contains("rotatoria")) {
             return "ROUND";
         }
-
-        // ORS: 0 left, 1 right, 2 sharp left, 3 sharp right,
-        // 4 slight left, 5 slight right, 6 straight,
-        // 10 destination, 11 depart.
-        if (type == 0 || type == 2 || type == 4 || instr.contains("left") || instr.contains("sinistra")) return "LEFT";
-        if (type == 1 || type == 3 || type == 5 || instr.contains("right") || instr.contains("destra")) return "RIGHT";
+        if (type == 9 || instr.contains("u-turn") || instr.contains("inversione")) return "UTURN";
+        if (type == 0 || type == 2 || type == 4 || type == 12 || instr.contains("left") || instr.contains("sinistra")) return "LEFT";
+        if (type == 1 || type == 3 || type == 5 || type == 13 || instr.contains("right") || instr.contains("destra")) return "RIGHT";
 
         return "STRAIGHT";
+    }
+
+    private String validatedTurnForManeuver(ArrayList<LatLon> pts, Maneuver m) {
+        String orsTurn = turnFromOpenRouteType(m.type, m.instruction);
+        if ("ROUND".equals(orsTurn) || "UTURN".equals(orsTurn) || "STRAIGHT".equals(orsTurn)) return orsTurn;
+        if (pts == null || pts.size() < 5) return orsTurn;
+
+        int j = Math.max(1, Math.min(m.startIndex, pts.size() - 2));
+        int before = Math.max(0, j - 4);
+        int after = Math.min(pts.size() - 1, j + 5);
+        if (before == j || after == j) return orsTurn;
+
+        double inBearing = bearing(pts.get(before).lat, pts.get(before).lon, pts.get(j).lat, pts.get(j).lon);
+        double outBearing = bearing(pts.get(j).lat, pts.get(j).lon, pts.get(after).lat, pts.get(after).lon);
+        double delta = angleDiff(inBearing, outBearing);
+
+        // Only override the textual/type instruction when the route geometry itself
+        // shows a clear turn in the opposite direction. Small ramp/keep angles retain
+        // the authoritative ORS instruction.
+        if (delta >= 28.0 && "LEFT".equals(orsTurn)) return "RIGHT";
+        if (delta <= -28.0 && "RIGHT".equals(orsTurn)) return "LEFT";
+        return orsTurn;
     }
 
     private int distanceAlongRoute(ArrayList<LatLon> pts, int from, int to) {
@@ -551,6 +608,163 @@ public class NavigationService extends Service {
             if (acc > 99999) return 99999;
         }
         return (int) Math.round(acc);
+    }
+
+    private void requestContextRoadsIfNeeded(Location loc) {
+        if (loc == null || contextRoadRequestInProgress) return;
+
+        long now = System.currentTimeMillis();
+        boolean movedFar = Double.isNaN(lastContextRoadsLat) ||
+                distanceMeters(lastContextRoadsLat, lastContextRoadsLon,
+                        loc.getLatitude(), loc.getLongitude()) >= CONTEXT_ROADS_REFRESH_DISTANCE_M;
+        long age = now - lastContextRoadsMs;
+        if (age < CONTEXT_ROADS_MIN_REFRESH_MS) return;
+        if (!movedFar && age < CONTEXT_ROADS_REFRESH_MS) return;
+
+        contextRoadRequestInProgress = true;
+        lastContextRoadsMs = now;
+        final double lat = loc.getLatitude();
+        final double lon = loc.getLongitude();
+        // Remember the attempted centre even if Overpass is temporarily unavailable,
+        // otherwise a failed request would be retried every 1 Hz heartbeat.
+        lastContextRoadsLat = lat;
+        lastContextRoadsLon = lon;
+
+        new Thread(() -> {
+            ArrayList<ArrayList<LatLon>> found = new ArrayList<>();
+            try {
+                found = requestNearbyRoadGeometry(lat, lon);
+            } catch (Exception ignored) {
+            }
+
+            final ArrayList<ArrayList<LatLon>> result = found;
+            handler.post(() -> {
+                contextRoadRequestInProgress = false;
+                if (!result.isEmpty()) {
+                    synchronized (contextRoads) {
+                        contextRoads.clear();
+                        contextRoads.addAll(result);
+                    }
+                    // Push the newly available grey road context to the Carlyle without
+                    // waiting for the next GPS callback.
+                    if (running) sendNavUpdate(false);
+                }
+            });
+        }).start();
+    }
+
+    private ArrayList<ArrayList<LatLon>> requestNearbyRoadGeometry(double lat, double lon) throws Exception {
+        URL url = new URL("https://overpass-api.de/api/interpreter");
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setConnectTimeout(5000);
+        c.setReadTimeout(6000);
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8");
+
+        String highwayRegex = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|service|unclassified|road";
+        String query = "[out:json][timeout:5];" +
+                "way(around:" + (int) CONTEXT_ROADS_QUERY_RADIUS_M + "," + lat + "," + lon + ")" +
+                "[\"highway\"~\"^(" + highwayRegex + ")$\"];" +
+                "out geom;";
+        String body = "data=" + URLEncoder.encode(query, "UTF-8");
+
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
+        String txt = readAll(is);
+        if (c.getResponseCode() >= 400) return new ArrayList<>();
+
+        JSONObject json = new JSONObject(txt);
+        JSONArray elements = json.optJSONArray("elements");
+        ArrayList<ArrayList<LatLon>> out = new ArrayList<>();
+        if (elements == null) return out;
+
+        for (int i = 0; i < elements.length() && out.size() < 28; i++) {
+            JSONObject e = elements.optJSONObject(i);
+            if (e == null) continue;
+            JSONArray geometry = e.optJSONArray("geometry");
+            if (geometry == null || geometry.length() < 2) continue;
+
+            ArrayList<LatLon> way = new ArrayList<>();
+            int stride = Math.max(1, geometry.length() / 90);
+            for (int g = 0; g < geometry.length(); g += stride) {
+                JSONObject p = geometry.optJSONObject(g);
+                if (p == null) continue;
+                double plat = p.optDouble("lat", Double.NaN);
+                double plon = p.optDouble("lon", Double.NaN);
+                if (Double.isNaN(plat) || Double.isNaN(plon)) continue;
+                if (distanceMeters(lat, lon, plat, plon) <= 330.0) {
+                    way.add(new LatLon(plat, plon));
+                }
+            }
+            if (way.size() >= 2) out.add(way);
+        }
+        return out;
+    }
+
+    private String buildScreenRoads(ArrayList<LatLon> routePts, RouteMatch match, Location loc,
+                                    String turn, int distToTurn) {
+        ArrayList<ArrayList<LatLon>> ways = new ArrayList<>();
+        synchronized (contextRoads) {
+            for (ArrayList<LatLon> way : contextRoads) ways.add(new ArrayList<>(way));
+        }
+        if (ways.isEmpty() || routePts.size() < 2) return "";
+
+        int idx = Math.max(0, Math.min(match.index, routePts.size() - 1));
+        double lat0 = match.lat;
+        double lon0 = match.lon;
+        double lat0Rad = Math.toRadians(lat0);
+        double metersPerDegLat = 111320.0;
+        double metersPerDegLon = Math.max(1.0, Math.cos(lat0Rad) * 111320.0);
+
+        int headingEnd = Math.min(idx + 4, routePts.size() - 1);
+        LatLon headingPoint = routePts.get(headingEnd);
+        double head = bearing(lat0, lon0, headingPoint.lat, headingPoint.lon);
+        float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
+        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
+            double gpsHead = loc.getBearing();
+            if (Math.abs(angleDiff(head, gpsHead)) < 55.0) head = gpsHead;
+        }
+
+        double h = Math.toRadians(head);
+        double sinH = Math.sin(h);
+        double cosH = Math.cos(h);
+        double pixelsPerMeter = ("ROUND".equals(turn) && distToTurn >= 0 && distToTurn <= 140)
+                ? ROUNDABOUT_PIXELS_PER_METER : SCREEN_PIXELS_PER_METER;
+
+        StringBuilder out = new StringBuilder(6000);
+        int emittedWays = 0;
+        for (ArrayList<LatLon> way : ways) {
+            StringBuilder one = new StringBuilder();
+            int visiblePoints = 0;
+            for (LatLon p : way) {
+                double east = (p.lon - lon0) * metersPerDegLon;
+                double north = (p.lat - lat0) * metersPerDegLat;
+                double right = east * cosH - north * sinH;
+                double forward = east * sinH + north * cosH;
+                double sx = 120.0 + right * pixelsPerMeter;
+                double sy = 164.0 - forward * pixelsPerMeter;
+
+                // Keep a generous margin so roads crossing the round screen remain
+                // continuous, but do not waste Bluetooth payload on remote geometry.
+                if (sx < -90 || sx > 330 || sy < -90 || sy > 330) continue;
+                if (one.length() > 0) one.append(';');
+                one.append(Math.round(sx * 10.0) / 10.0).append(',')
+                        .append(Math.round(sy * 10.0) / 10.0);
+                visiblePoints++;
+                if (visiblePoints >= 70) break;
+            }
+            if (visiblePoints >= 2) {
+                if (out.length() > 0) out.append('|');
+                out.append(one);
+                emittedWays++;
+                if (emittedWays >= 22 || out.length() > 11000) break;
+            }
+        }
+        return out.toString();
     }
 
     private void requestSpeedLimitIfNeeded(Location loc) {

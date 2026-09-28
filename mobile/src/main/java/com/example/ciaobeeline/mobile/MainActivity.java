@@ -2,6 +2,7 @@ package com.example.ciaobeeline.mobile;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -55,6 +56,7 @@ public class MainActivity extends Activity {
     private static final String PREF_DESTINATION = "destination_text";
     private static final String PREF_ROUTE_MODE = "route_mode";
     private static final String PREF_ALLOW_FAST_ROADS = "allow_fast_roads";
+    private static final String PREF_FAVORITES = "favorite_destinations_v1";
 
     // Tile source OSM con User-Agent esplicito: evita il profilo MAPNIK di osmdroid
     // che forza il User-Agent normalizzato package/versione.
@@ -84,7 +86,9 @@ public class MainActivity extends Activity {
     private boolean allowFastRoads = false;
     private MapView routeMap;
     private MapEventsOverlay mapEventsOverlay;
+    private LinearLayout favoritesContainer;
     private final ArrayList<GeoPoint> selectedRoutePoints = new ArrayList<>();
+    private final ArrayList<Favorite> favorites = new ArrayList<>();
 
     @Override
     public void onCreate(Bundle b) {
@@ -115,9 +119,29 @@ public class MainActivity extends Activity {
         apiKeyEdit.setHint("OpenRouteService API key");
         root.addView(apiKeyEdit);
 
+        LinearLayout destinationRow = new LinearLayout(this);
+        destinationRow.setOrientation(LinearLayout.HORIZONTAL);
+
         destinationEdit = new EditText(this);
         destinationEdit.setHint("Destinazione, es. Via Roma, Cagliari");
-        root.addView(destinationEdit);
+        destinationRow.addView(destinationEdit, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button saveFavoriteButton = new Button(this);
+        saveFavoriteButton.setText("★ SALVA");
+        destinationRow.addView(saveFavoriteButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(destinationRow);
+
+        TextView favoritesTitle = new TextView(this);
+        favoritesTitle.setText("Preferiti");
+        favoritesTitle.setTextSize(16);
+        favoritesTitle.setPadding(0, 10, 0, 4);
+        root.addView(favoritesTitle);
+
+        favoritesContainer = new LinearLayout(this);
+        favoritesContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(favoritesContainer);
 
         fastestButton = new Button(this);
         fastestButton.setText("TRAGITTO: PIÙ VELOCE");
@@ -211,7 +235,11 @@ public class MainActivity extends Activity {
         setContentView(scroll);
 
         loadPrefs();
+        loadFavorites();
+        refreshFavoritesUi();
         updateRouteModeButtons();
+
+        saveFavoriteButton.setOnClickListener(v -> showSaveFavoriteDialog());
 
         fastestButton.setOnClickListener(v -> {
             routeMode = "fastest";
@@ -291,6 +319,151 @@ public class MainActivity extends Activity {
                 .putString(PREF_ROUTE_MODE, routeMode)
                 .putBoolean(PREF_ALLOW_FAST_ROADS, allowFastRoads)
                 .apply();
+    }
+
+    private void loadFavorites() {
+        favorites.clear();
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_FAVORITES, "[]");
+        try {
+            JSONArray a = new JSONArray(raw);
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i);
+                if (o == null) continue;
+                String name = o.optString("name", "").trim();
+                String address = o.optString("address", "").trim();
+                if (!name.isEmpty() && !address.isEmpty()) favorites.add(new Favorite(name, address));
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void persistFavorites() {
+        JSONArray a = new JSONArray();
+        try {
+            for (Favorite f : favorites) {
+                JSONObject o = new JSONObject();
+                o.put("name", f.name);
+                o.put("address", f.address);
+                a.put(o);
+            }
+        } catch (Exception ignored) {
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_FAVORITES, a.toString()).apply();
+    }
+
+    private void refreshFavoritesUi() {
+        if (favoritesContainer == null) return;
+        favoritesContainer.removeAllViews();
+
+        if (favorites.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("Nessuna destinazione salvata");
+            empty.setTextSize(13);
+            favoritesContainer.addView(empty);
+            return;
+        }
+
+        for (int i = 0; i < favorites.size(); i++) {
+            final int index = i;
+            Favorite f = favorites.get(i);
+            Button b = new Button(this);
+            b.setAllCaps(false);
+            b.setText("★ " + f.name);
+            b.setOnClickListener(v -> {
+                Favorite selected = favorites.get(index);
+                destinationEdit.setText(selected.address);
+                savePrefs();
+                status.setText("Destinazione selezionata: " + selected.name);
+            });
+            b.setOnLongClickListener(v -> {
+                showFavoriteActions(index);
+                return true;
+            });
+            favoritesContainer.addView(b);
+        }
+    }
+
+    private void showSaveFavoriteDialog() {
+        String address = destinationEdit.getText().toString().trim();
+        if (address.length() < 3) {
+            status.setText("Inserisci prima una destinazione da salvare.");
+            return;
+        }
+
+        EditText nameEdit = new EditText(this);
+        nameEdit.setHint("Nome, es. Campo di atletica");
+
+        new AlertDialog.Builder(this)
+                .setTitle("Salva destinazione")
+                .setMessage(address)
+                .setView(nameEdit)
+                .setNegativeButton("Annulla", null)
+                .setPositiveButton("Salva", (dialog, which) -> {
+                    String name = nameEdit.getText().toString().trim();
+                    if (name.isEmpty()) name = address;
+
+                    int existing = -1;
+                    for (int i = 0; i < favorites.size(); i++) {
+                        if (favorites.get(i).address.equalsIgnoreCase(address)) {
+                            existing = i;
+                            break;
+                        }
+                    }
+
+                    if (existing >= 0) {
+                        favorites.get(existing).name = name;
+                    } else {
+                        favorites.add(new Favorite(name, address));
+                    }
+                    persistFavorites();
+                    refreshFavoritesUi();
+                    status.setText("Preferito salvato: " + name);
+                })
+                .show();
+    }
+
+    private void showFavoriteActions(int index) {
+        if (index < 0 || index >= favorites.size()) return;
+        Favorite f = favorites.get(index);
+        new AlertDialog.Builder(this)
+                .setTitle(f.name)
+                .setItems(new String[]{"Rinomina", "Elimina"}, (dialog, which) -> {
+                    if (which == 0) showRenameFavoriteDialog(index);
+                    else deleteFavorite(index);
+                })
+                .setNegativeButton("Annulla", null)
+                .show();
+    }
+
+    private void showRenameFavoriteDialog(int index) {
+        if (index < 0 || index >= favorites.size()) return;
+        Favorite f = favorites.get(index);
+        EditText nameEdit = new EditText(this);
+        nameEdit.setText(f.name);
+        nameEdit.setSelection(nameEdit.getText().length());
+
+        new AlertDialog.Builder(this)
+                .setTitle("Rinomina preferito")
+                .setView(nameEdit)
+                .setNegativeButton("Annulla", null)
+                .setPositiveButton("Salva", (dialog, which) -> {
+                    String name = nameEdit.getText().toString().trim();
+                    if (name.isEmpty()) return;
+                    favorites.get(index).name = name;
+                    persistFavorites();
+                    refreshFavoritesUi();
+                    status.setText("Preferito rinominato: " + name);
+                })
+                .show();
+    }
+
+    private void deleteFavorite(int index) {
+        if (index < 0 || index >= favorites.size()) return;
+        String name = favorites.get(index).name;
+        favorites.remove(index);
+        persistFavorites();
+        refreshFavoritesUi();
+        status.setText("Preferito eliminato: " + name);
     }
 
     private void updateRouteModeButtons() {
@@ -844,6 +1017,16 @@ public class MainActivity extends Activity {
     protected void onPause() {
         if (routeMap != null) routeMap.onPause();
         super.onPause();
+    }
+
+    private static class Favorite {
+        String name;
+        final String address;
+
+        Favorite(String name, String address) {
+            this.name = name;
+            this.address = address;
+        }
     }
 
     private static class LatLon {
