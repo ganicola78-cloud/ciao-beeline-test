@@ -283,6 +283,9 @@ public class MainActivity extends Activity {
                     removeSelectedRoutePoint(existingIndex);
                 } else {
                     addSelectedRoutePoint(p);
+                    if (selectedRoutePoints.size() == 1) {
+                        showSelectedMapPointActions(0);
+                    }
                 }
                 return true;
             }
@@ -685,6 +688,62 @@ public class MainActivity extends Activity {
                     status.setText("Punto salvato: " + name);
                 })
                 .show();
+    }
+
+
+    private void showSelectedMapPointActions(int index) {
+        if (index < 0 || index >= selectedRoutePoints.size()) return;
+
+        lastSelectedPointIndex = index;
+        GeoPoint p = selectedRoutePoints.get(index);
+        String coords = String.format(
+                java.util.Locale.US,
+                "%.6f, %.6f",
+                p.getLatitude(),
+                p.getLongitude()
+        );
+
+        new AlertDialog.Builder(this)
+                .setTitle("Punto selezionato")
+                .setMessage(coords)
+                .setItems(new String[]{
+                                "Naviga qui dalla posizione attuale",
+                                "Salva punto",
+                                "Usa per creare un tragitto",
+                                "Rimuovi punto"
+                        },
+                        (dialog, which) -> {
+                            if (which == 0) {
+                                startRoutingServiceToMapPoint(index);
+                            } else if (which == 1) {
+                                showSaveMapPointDialog();
+                            } else if (which == 2) {
+                                status.setText("Punto mantenuto per il tragitto. Seleziona altri punti sulla mappa.");
+                            } else {
+                                removeSelectedRoutePoint(index);
+                            }
+                        })
+                .setNegativeButton("Chiudi", null)
+                .show();
+    }
+
+    private void startRoutingServiceToMapPoint(int index) {
+        if (index < 0 || index >= selectedRoutePoints.size()) return;
+        if (!validateNavigationPrerequisites(false)) return;
+
+        GeoPoint p = selectedRoutePoints.get(index);
+        savePrefs();
+
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_NAV_SOURCE, "point")
+                .putString(PREF_NAV_TARGET_LAT, Double.toString(p.getLatitude()))
+                .putString(PREF_NAV_TARGET_LON, Double.toString(p.getLongitude()))
+                .putString(PREF_NAV_TARGET_LABEL, "Punto selezionato")
+                .putString(PREF_NAV_ROUTE_POINTS, "[]")
+                .apply();
+
+        launchNavigationService();
+        status.setText("Navigazione avviata dalla posizione GPS attuale al punto selezionato.");
     }
 
     private int findSavedPointNear(double lat, double lon, double maxMeters) {
@@ -1102,14 +1161,15 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Se sono stati scelti punti sulla mappa, usa quelli:
-        // primo = partenza, ultimo = arrivo, intermedi = waypoint.
-        if (!selectedRoutePoints.isEmpty()) {
-            if (selectedRoutePoints.size() < 2) {
-                status.setText("Hai selezionato la partenza. Tieni premuto su almeno un secondo punto per impostare l'arrivo.");
-                return;
-            }
+        // Se è stato scelto un solo punto sulla mappa, trattalo come destinazione:
+        // la partenza è la posizione GPS attuale.
+        if (selectedRoutePoints.size() == 1) {
+            showPreviewFromCurrentLocationToMapPoint(key, selectedRoutePoints.get(0));
+            return;
+        }
 
+        // Con 2 o più punti: primo = partenza, ultimo = arrivo, intermedi = waypoint.
+        if (selectedRoutePoints.size() >= 2) {
             fetchAndDrawPreviewFromSelectedPoints(key);
             return;
         }
@@ -1161,6 +1221,61 @@ public class MainActivity extends Activity {
         }
     }
 
+
+    private void showPreviewFromCurrentLocationToMapPoint(String key, GeoPoint point) {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            status.setText("Concedi il permesso posizione per navigare verso il punto.");
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 5);
+            return;
+        }
+
+        LocationManager lm = (LocationManager) getSystemService(LOCATION_SERVICE);
+        if (lm == null) {
+            status.setText("GPS non disponibile.");
+            return;
+        }
+
+        Location last = bestLastLocation(lm);
+        if (last != null) {
+            fetchAndDrawPreviewToMapPoint(key, point, last);
+            return;
+        }
+
+        status.setText("Cerco posizione GPS...");
+        try {
+            LocationListener once = new LocationListener() {
+                @Override public void onLocationChanged(Location location) {
+                    try { lm.removeUpdates(this); } catch (Exception ignored) {}
+                    fetchAndDrawPreviewToMapPoint(key, point, location);
+                }
+
+                @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+                @Override public void onProviderEnabled(String provider) {}
+                @Override public void onProviderDisabled(String provider) {}
+            };
+
+            try { lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, once); } catch (Exception ignored) {}
+            try { lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, once); } catch (Exception ignored) {}
+        } catch (SecurityException e) {
+            status.setText("Permesso posizione mancante.");
+        }
+    }
+
+    private void fetchAndDrawPreviewToMapPoint(String key, GeoPoint point, Location startLocation) {
+        status.setText("Calcolo percorso dalla posizione attuale al punto selezionato...");
+
+        final LatLon dest = new LatLon(point.getLatitude(), point.getLongitude());
+
+        new Thread(() -> {
+            try {
+                PreviewRoute previewRoute = previewRequestDirections(key, startLocation, dest);
+                runOnUiThread(() -> drawPreviewRoute(previewRoute, startLocation, dest));
+            } catch (Exception e) {
+                runOnUiThread(() -> status.setText("Errore anteprima: " + e.getMessage()));
+            }
+        }).start();
+    }
+
     private void addSelectedRoutePoint(GeoPoint p) {
         GeoPoint point = new GeoPoint(p.getLatitude(), p.getLongitude());
         selectedRoutePoints.add(point);
@@ -1170,7 +1285,7 @@ public class MainActivity extends Activity {
 
         int count = selectedRoutePoints.size();
         if (count == 1) {
-            status.setText("Partenza selezionata. Tieni premuto su un altro punto per impostare l'arrivo.");
+            status.setText("Punto selezionato: puoi navigare qui dalla posizione attuale, salvarlo oppure usarlo per creare un tragitto.");
         } else if (count == 2) {
             status.setText("Partenza e arrivo selezionati. Puoi aggiungere altri punti tenendo premuto, poi premi VEDI TRAGITTO SU MAPPA.");
         } else {
@@ -1260,13 +1375,21 @@ public class MainActivity extends Activity {
             marker.setPosition(selectedRoutePoints.get(i));
             marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM);
 
-            if (i == 0) {
+            if (selectedRoutePoints.size() == 1) {
+                marker.setTitle("Destinazione selezionata");
+            } else if (i == 0) {
                 marker.setTitle("1 - Partenza");
             } else if (i == selectedRoutePoints.size() - 1) {
                 marker.setTitle((i + 1) + " - Arrivo");
             } else {
                 marker.setTitle((i + 1) + " - Waypoint");
             }
+
+            final int markerIndex = i;
+            marker.setOnMarkerClickListener((clickedMarker, mapView) -> {
+                showSelectedMapPointActions(markerIndex);
+                return true;
+            });
 
             routeMap.getOverlays().add(marker);
         }
@@ -1573,8 +1696,9 @@ public class MainActivity extends Activity {
     }
 
     private void startRoutingService() {
+        boolean hasSingleMapTarget = selectedRoutePoints.size() == 1;
         boolean hasRoutePoints = selectedRoutePoints.size() >= 2;
-        if (!validateNavigationPrerequisites(!hasRoutePoints)) return;
+        if (!validateNavigationPrerequisites(!hasSingleMapTarget && !hasRoutePoints)) return;
 
         SharedPreferences.Editor e = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
         if (hasRoutePoints) {
@@ -1583,6 +1707,13 @@ public class MainActivity extends Activity {
                     .putString(PREF_NAV_TARGET_LABEL, "Tragitto con waypoint")
                     .putString(PREF_NAV_TARGET_LAT, "")
                     .putString(PREF_NAV_TARGET_LON, "");
+        } else if (hasSingleMapTarget) {
+            GeoPoint p = selectedRoutePoints.get(0);
+            e.putString(PREF_NAV_SOURCE, "point")
+                    .putString(PREF_NAV_ROUTE_POINTS, "[]")
+                    .putString(PREF_NAV_TARGET_LABEL, "Punto selezionato")
+                    .putString(PREF_NAV_TARGET_LAT, Double.toString(p.getLatitude()))
+                    .putString(PREF_NAV_TARGET_LON, Double.toString(p.getLongitude()));
         } else {
             e.putString(PREF_NAV_SOURCE, "text")
                     .putString(PREF_NAV_ROUTE_POINTS, "[]")
@@ -1598,6 +1729,8 @@ public class MainActivity extends Activity {
             int waypointCount = Math.max(0, selectedRoutePoints.size() - 2);
             status.setText("Navigazione avviata sul tragitto selezionato con " + waypointCount +
                     (waypointCount == 1 ? " waypoint." : " waypoint."));
+        } else if (hasSingleMapTarget) {
+            status.setText("Navigazione avviata dalla posizione GPS attuale al punto selezionato.");
         } else {
             status.setText("Navigazione avviata. Ora puoi spegnere lo schermo: deve restare la notifica Ciao Beeline.");
         }
