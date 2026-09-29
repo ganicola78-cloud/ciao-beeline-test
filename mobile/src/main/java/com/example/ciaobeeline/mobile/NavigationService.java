@@ -58,7 +58,6 @@ public class NavigationService extends Service {
     private static final double OFF_ROUTE_RECALC_METERS = 14.0;
     private static final double OFF_ROUTE_WARN_METERS = 24.0;
     private static final long RECALC_COOLDOWN_MS = 1200;
-    private static final long PERIODIC_RECALC_MS = 30000;
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
     private static final long HEARTBEAT_MS = 1000;
@@ -149,9 +148,11 @@ public class NavigationService extends Service {
                     long now = System.currentTimeMillis();
                     boolean offRoute = offRouteMeters > OFF_ROUTE_RECALC_METERS;
                     boolean cooldownPassed = now - lastRouteMs > RECALC_COOLDOWN_MS;
-                    boolean periodicRefresh = now - lastRouteMs > PERIODIC_RECALC_MS;
 
-                    if ((offRoute && cooldownPassed) || periodicRefresh) {
+                    // V0.25: no periodic route recalculation. A new ORS route is requested
+                    // only when the device is actually off-route (or when the route is empty).
+                    // Normal GPS/Carlyle updates continue without consuming routing quota.
+                    if (offRoute && cooldownPassed) {
                         requestRoute(true);
                     } else {
                         sendNavUpdate(false);
@@ -292,9 +293,9 @@ public class NavigationService extends Service {
 
         boolean offRoute = offRouteMeters > OFF_ROUTE_RECALC_METERS;
         boolean cooldownPassed = now - lastRouteMs > RECALC_COOLDOWN_MS;
-        boolean periodicRefresh = now - lastRouteMs > PERIODIC_RECALC_MS;
 
-        if ((offRoute && cooldownPassed) || periodicRefresh) {
+        // V0.25: do not burn ORS quota with a timed refresh while we are on-route.
+        if (offRoute && cooldownPassed) {
             requestRoute(true);
         } else {
             sendNavUpdate(false);

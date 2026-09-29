@@ -84,6 +84,8 @@ public class MainActivity extends Activity {
     );
 
     private EditText apiKeyEdit;
+    private TextView apiKeySavedLabel;
+    private Button apiKeyButton;
     private EditText destinationEdit;
     private TextView status;
     private Button fastestButton;
@@ -129,9 +131,29 @@ public class MainActivity extends Activity {
         title.setTextSize(22);
         root.addView(title);
 
+        LinearLayout apiKeyRow = new LinearLayout(this);
+        apiKeyRow.setOrientation(LinearLayout.HORIZONTAL);
+
         apiKeyEdit = new EditText(this);
         apiKeyEdit.setHint("OpenRouteService API key");
-        root.addView(apiKeyEdit);
+        apiKeyEdit.setSingleLine(true);
+        apiKeyEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT |
+                android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        apiKeyEdit.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
+        apiKeyRow.addView(apiKeyEdit, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        apiKeyButton = new Button(this);
+        apiKeyButton.setText("SALVA API");
+        apiKeyRow.addView(apiKeyButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(apiKeyRow);
+
+        apiKeySavedLabel = new TextView(this);
+        apiKeySavedLabel.setText("✓ Chiave OpenRouteService salvata");
+        apiKeySavedLabel.setTextSize(14);
+        apiKeySavedLabel.setVisibility(android.view.View.GONE);
+        root.addView(apiKeySavedLabel);
 
         LinearLayout destinationRow = new LinearLayout(this);
         destinationRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -284,7 +306,9 @@ public class MainActivity extends Activity {
         refreshSavedPointsUi();
         refreshSavedRoutesUi();
         updateRouteModeButtons();
+        updateApiKeyUi();
 
+        apiKeyButton.setOnClickListener(v -> handleApiKeyButton());
         saveFavoriteButton.setOnClickListener(v -> showSaveFavoriteDialog());
         saveMapPointButton.setOnClickListener(v -> showSaveMapPointDialog());
         saveRouteButton.setOnClickListener(v -> showSaveRouteDialog());
@@ -359,14 +383,59 @@ public class MainActivity extends Activity {
         allowFastRoads = p.getBoolean(PREF_ALLOW_FAST_ROADS, false);
     }
 
-    private void savePrefs() {
+    private String currentApiKey() {
+        String typed = apiKeyEdit == null ? "" : apiKeyEdit.getText().toString().trim();
+        if (typed.length() >= 8) return typed;
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_API_KEY, "").trim();
+    }
+
+    private void updateApiKeyUi() {
+        if (apiKeyEdit == null || apiKeySavedLabel == null || apiKeyButton == null) return;
+        boolean saved = currentApiKey().length() >= 8;
+        if (saved) {
+            apiKeyEdit.setVisibility(android.view.View.GONE);
+            apiKeySavedLabel.setVisibility(android.view.View.VISIBLE);
+            apiKeyButton.setText("CAMBIA API");
+        } else {
+            apiKeyEdit.setVisibility(android.view.View.VISIBLE);
+            apiKeySavedLabel.setVisibility(android.view.View.GONE);
+            apiKeyButton.setText("SALVA API");
+        }
+    }
+
+    private void handleApiKeyButton() {
+        if (apiKeyEdit.getVisibility() == android.view.View.GONE) {
+            apiKeyEdit.setVisibility(android.view.View.VISIBLE);
+            apiKeySavedLabel.setVisibility(android.view.View.GONE);
+            apiKeyButton.setText("SALVA API");
+            apiKeyEdit.requestFocus();
+            apiKeyEdit.setSelection(apiKeyEdit.getText().length());
+            return;
+        }
+
+        String key = apiKeyEdit.getText().toString().trim();
+        if (key.length() < 8) {
+            status.setText("Inserisci una chiave API OpenRouteService valida.");
+            return;
+        }
+
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
-                .putString(PREF_API_KEY, apiKeyEdit.getText().toString().trim())
-                .putString(PREF_DESTINATION, destinationEdit.getText().toString().trim())
+                .putString(PREF_API_KEY, key)
+                .apply();
+        status.setText("Chiave API salvata.");
+        updateApiKeyUi();
+    }
+
+    private void savePrefs() {
+        SharedPreferences.Editor e = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
+        String key = apiKeyEdit.getText().toString().trim();
+        if (key.length() >= 8) e.putString(PREF_API_KEY, key);
+        e.putString(PREF_DESTINATION, destinationEdit.getText().toString().trim())
                 .putString(PREF_ROUTE_MODE, routeMode)
                 .putBoolean(PREF_ALLOW_FAST_ROADS, allowFastRoads)
                 .apply();
+        if (key.length() >= 8) updateApiKeyUi();
     }
 
     private void loadFavorites() {
@@ -871,7 +940,7 @@ public class MainActivity extends Activity {
         status.setText("Tragitto caricato: " + r.name);
 
         if (calculatePreview) {
-            String key = apiKeyEdit.getText().toString().trim();
+            String key = currentApiKey();
             if (key.length() >= 8) fetchAndDrawPreviewFromSelectedPoints(key);
         }
     }
@@ -958,7 +1027,7 @@ public class MainActivity extends Activity {
     private boolean validateNavigationPrerequisites(boolean requireTextDestination) {
         savePrefs();
 
-        if (apiKeyEdit.getText().toString().trim().length() < 8) {
+        if (currentApiKey().length() < 8) {
             status.setText("Inserisci API key OpenRouteService.");
             return false;
         }
@@ -1026,7 +1095,7 @@ public class MainActivity extends Activity {
     private void showRoutePreviewOnMap() {
         savePrefs();
 
-        String key = apiKeyEdit.getText().toString().trim();
+        String key = currentApiKey();
 
         if (key.length() < 8) {
             status.setText("Inserisci API key OpenRouteService.");
