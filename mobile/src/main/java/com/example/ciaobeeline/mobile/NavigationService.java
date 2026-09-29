@@ -56,10 +56,13 @@ public class NavigationService extends Service {
     private static final String CHANNEL_ID = "ciao_beeline_navigation";
     private static final int NOTIFICATION_ID = 1001;
 
-    // V0.19: scelta più veloce/più breve + toggle autostrade/superstrade + distanza senza blocco a 999 m
-    // V0.27: off-route is now informational only. The original route is preserved
-    // until the user explicitly asks for a recalculation.
-    private static final double OFF_ROUTE_WARN_METERS = 24.0;
+    // V0.28: map-matching + automatic reroute with hysteresis.
+    // Normal GPS/map disagreement is tolerated; a real deviation must stay beyond
+    // the confirmation threshold for several seconds before a new ORS request is sent.
+    private static final double OFF_ROUTE_RESET_METERS = 25.0;
+    private static final double OFF_ROUTE_CONFIRM_METERS = 35.0;
+    private static final long OFF_ROUTE_CONFIRM_MS = 5000;
+    private static final long AUTO_REROUTE_COOLDOWN_MS = 30000;
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
     private static final long HEARTBEAT_MS = 1000;
@@ -88,6 +91,9 @@ public class NavigationService extends Service {
     private long lastRouteMs = 0;
     private long lastSendMs = 0;
     private double offRouteMeters = 9999;
+    private long offRouteSinceMs = 0;
+    private boolean offRouteConfirmed = false;
+    private long lastAutoRerouteMs = 0;
     private int lastSpeedLimit = -1;
     private long lastSpeedLimitMs = 0;
     private boolean speedLimitRequestInProgress = false;
@@ -139,15 +145,14 @@ public class NavigationService extends Service {
                 synchronized (route) { empty = route.isEmpty(); }
 
                 if (empty) {
-                    // Only the initial route is calculated automatically.
+                    // Initial route calculation.
                     requestRoute(false);
                 } else {
-                    // V0.27: with the screen off we still refresh GPS state and keep sending
-                    // navigation data to the Carlyle every second, but NEVER recalculate
-                    // automatically. If we leave the route, the watch shows FUORI ROTTA and
-                    // the original route remains loaded until the user presses RICALCOLA ROTTA.
-                    updateOffRouteDistance();
-                    sendNavUpdate(false);
+                    // V0.28: this same logic runs while the display is off. A deviation must
+                    // remain >35 m for 5 seconds before one automatic recalculation is started.
+                    // GPS drift inside the tolerance never consumes an ORS request.
+                    updateOffRouteStateAndMaybeReroute();
+                    if (!routeRequestInProgress) sendNavUpdate(false);
                 }
             }
 
@@ -228,6 +233,9 @@ public class NavigationService extends Service {
         lastRouteMs = 0;
         lastSendMs = 0;
         offRouteMeters = 9999;
+        offRouteSinceMs = 0;
+        offRouteConfirmed = false;
+        lastAutoRerouteMs = 0;
         lastSpeedLimit = -1;
         lastSpeedLimitMs = 0;
         speedLimitRequestInProgress = false;
@@ -291,6 +299,9 @@ public class NavigationService extends Service {
         synchronized (maneuvers) { maneuvers.clear(); }
         synchronized (contextRoads) { contextRoads.clear(); }
         offRouteMeters = 0;
+        offRouteSinceMs = 0;
+        offRouteConfirmed = false;
+        lastAutoRerouteMs = 0;
         lastSendMs = 0;
 
         updateNotification("Percorso cancellato", "In attesa di una nuova navigazione");
@@ -322,24 +333,52 @@ public class NavigationService extends Service {
             return;
         }
 
-        // V0.27: never change the route automatically. This keeps navigation predictable
-        // and avoids quota consumption caused by GPS drift or parallel roads.
-        updateOffRouteDistance();
-        sendNavUpdate(false);
+        updateOffRouteStateAndMaybeReroute();
+        if (!routeRequestInProgress) sendNavUpdate(false);
     };
 
-    private void updateOffRouteDistance() {
+    private void updateOffRouteStateAndMaybeReroute() {
         if (currentLocation == null) return;
 
         ArrayList<LatLon> copy;
         synchronized (route) {
             copy = new ArrayList<>(route);
         }
-
         if (copy.isEmpty()) return;
 
         RouteMatch match = matchRoute(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
         offRouteMeters = match.offMeters;
+
+        long now = System.currentTimeMillis();
+
+        // Back close to the route: clear the off-route episode. This hysteresis prevents
+        // 25-35 m GPS jitter from repeatedly arming/disarming the reroute timer.
+        if (offRouteMeters <= OFF_ROUTE_RESET_METERS) {
+            offRouteSinceMs = 0;
+            offRouteConfirmed = false;
+            return;
+        }
+
+        // 25-35 m is a tolerance band: keep the visual navigation snapped to the route
+        // and do not start a recalculation timer. If already confirmed, keep OFF_ROUTE
+        // until we really return inside the reset band.
+        if (offRouteMeters < OFF_ROUTE_CONFIRM_METERS) {
+            if (!offRouteConfirmed) offRouteSinceMs = 0;
+            return;
+        }
+
+        if (offRouteSinceMs == 0) offRouteSinceMs = now;
+        if (now - offRouteSinceMs < OFF_ROUTE_CONFIRM_MS) return;
+
+        offRouteConfirmed = true;
+
+        // First real deviation: reroute automatically. Cooldown prevents repeated quota
+        // consumption if ORS fails or the GPS remains poor. Manual RICALCOLA still bypasses
+        // this guard because ACTION_REROUTE calls requestRoute() directly.
+        if (!routeRequestInProgress && now - lastAutoRerouteMs >= AUTO_REROUTE_COOLDOWN_MS) {
+            lastAutoRerouteMs = now;
+            requestRoute(true);
+        }
     }
 
     private void requestRoute(boolean forceStatus) {
@@ -407,6 +446,9 @@ public class NavigationService extends Service {
 
                 handler.post(() -> {
                     routeRequestInProgress = false;
+                    offRouteSinceMs = 0;
+                    offRouteConfirmed = false;
+                    offRouteMeters = 0;
                     updateNotification("Rotta aggiornata", navigationLabel() + " - " +
                             ("shortest".equals(routeMode) ? "breve" : "veloce") +
                             (allowFastRoads ? " + strade veloci" : " no autostrade") +
@@ -616,7 +658,7 @@ public class NavigationService extends Service {
 
         try {
             JSONObject o = new JSONObject();
-            o.put("mode", offRouteMeters > OFF_ROUTE_WARN_METERS ? "OFF_ROUTE" : "NAV");
+            o.put("mode", offRouteConfirmed ? "OFF_ROUTE" : "NAV");
             o.put("seq", ++navSeq);
             o.put("recalculated", recalculated);
             o.put("speed", Math.round(speedKmh));
@@ -628,7 +670,7 @@ public class NavigationService extends Service {
             o.put("roads", roads);
 
             sendToWear(o.toString());
-            updateNotification(offRouteMeters > OFF_ROUTE_WARN_METERS ? "Fuori rotta" : "Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
+            updateNotification(offRouteConfirmed ? "Fuori rotta" : "Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
         } catch (JSONException ignored) {}
     }
 

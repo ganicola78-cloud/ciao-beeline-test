@@ -102,6 +102,8 @@ public class MainActivity extends Activity {
     private MapView routeMap;
     private MapEventsOverlay mapEventsOverlay;
     private Marker currentLocationMarker;
+    private final ArrayList<GeoPoint> displayedRoutePoints = new ArrayList<>();
+    private static final double PHONE_ROUTE_SNAP_METERS = 20.0;
     private LocationManager mapLocationManager;
     private Location lastMapLocation;
     private boolean mapCenteredOnGpsOnce = false;
@@ -449,7 +451,8 @@ public class MainActivity extends Activity {
             currentLocationMarker.setTitle("Posizione GPS attuale");
         }
 
-        GeoPoint position = new GeoPoint(location.getLatitude(), location.getLongitude());
+        GeoPoint rawPosition = new GeoPoint(location.getLatitude(), location.getLongitude());
+        GeoPoint position = snapPhonePositionToDisplayedRoute(rawPosition);
         currentLocationMarker.setPosition(position);
         if (location.hasBearing()) currentLocationMarker.setRotation(location.getBearing());
         addCurrentLocationMarkerOverlay();
@@ -460,6 +463,54 @@ public class MainActivity extends Activity {
             mapCenteredOnGpsOnce = true;
         }
         routeMap.invalidate();
+    }
+
+    private GeoPoint snapPhonePositionToDisplayedRoute(GeoPoint raw) {
+        if (raw == null || displayedRoutePoints.size() < 2) return raw;
+
+        double lat = raw.getLatitude();
+        double lon = raw.getLongitude();
+        double latRad = Math.toRadians(lat);
+        double metersPerDegLat = 111320.0;
+        double metersPerDegLon = Math.max(1.0, Math.cos(latRad) * 111320.0);
+
+        double best = Double.MAX_VALUE;
+        double bestLat = lat;
+        double bestLon = lon;
+
+        for (int i = 0; i < displayedRoutePoints.size() - 1; i++) {
+            GeoPoint a = displayedRoutePoints.get(i);
+            GeoPoint b = displayedRoutePoints.get(i + 1);
+
+            double ax = (a.getLongitude() - lon) * metersPerDegLon;
+            double ay = (a.getLatitude() - lat) * metersPerDegLat;
+            double bx = (b.getLongitude() - lon) * metersPerDegLon;
+            double by = (b.getLatitude() - lat) * metersPerDegLat;
+
+            double vx = bx - ax;
+            double vy = by - ay;
+            double len2 = vx * vx + vy * vy;
+            double t = 0.0;
+            if (len2 > 0.001) {
+                t = -(ax * vx + ay * vy) / len2;
+                if (t < 0.0) t = 0.0;
+                if (t > 1.0) t = 1.0;
+            }
+
+            double px = ax + vx * t;
+            double py = ay + vy * t;
+            double d = Math.sqrt(px * px + py * py);
+            if (d < best) {
+                best = d;
+                bestLat = a.getLatitude() + (b.getLatitude() - a.getLatitude()) * t;
+                bestLon = a.getLongitude() + (b.getLongitude() - a.getLongitude()) * t;
+            }
+        }
+
+        // Only normal GPS/map disagreement is visually corrected. Beyond 20 m we show
+        // the real GPS position so an actual deviation remains visible on the phone.
+        if (best <= PHONE_ROUTE_SNAP_METERS) return new GeoPoint(bestLat, bestLon);
+        return raw;
     }
 
     private void addCurrentLocationMarkerOverlay() {
@@ -1471,6 +1522,7 @@ public class MainActivity extends Activity {
     }
 
     private void redrawSelectedRoutePoints() {
+        displayedRoutePoints.clear();
         routeMap.getOverlays().clear();
 
         // Prima i marker, poi l'overlay degli eventi.
@@ -1700,6 +1752,8 @@ public class MainActivity extends Activity {
             return;
         }
 
+        displayedRoutePoints.clear();
+        displayedRoutePoints.addAll(previewRoute.points);
         routeMap.getOverlays().clear();
 
         Polyline line = new Polyline();
@@ -1737,6 +1791,8 @@ public class MainActivity extends Activity {
             return;
         }
 
+        displayedRoutePoints.clear();
+        displayedRoutePoints.addAll(previewRoute.points);
         routeMap.getOverlays().clear();
 
         Polyline line = new Polyline();
@@ -1890,6 +1946,7 @@ public class MainActivity extends Activity {
                 .apply();
 
         selectedRoutePoints.clear();
+        displayedRoutePoints.clear();
         lastSelectedPointIndex = -1;
         if (routeMap != null) {
             routeMap.getOverlays().clear();
