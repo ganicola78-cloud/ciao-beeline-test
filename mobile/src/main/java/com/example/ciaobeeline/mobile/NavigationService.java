@@ -51,13 +51,15 @@ public class NavigationService extends Service {
     private static final String PREF_NAV_ROUTE_POINTS = "nav_route_points_v1";
     public static final String ACTION_START = "com.example.ciaobeeline.START_NAV";
     public static final String ACTION_STOP = "com.example.ciaobeeline.STOP_NAV";
+    public static final String ACTION_REROUTE = "com.example.ciaobeeline.REROUTE_NAV";
+    public static final String ACTION_CLEAR_ROUTE = "com.example.ciaobeeline.CLEAR_ROUTE";
     private static final String CHANNEL_ID = "ciao_beeline_navigation";
     private static final int NOTIFICATION_ID = 1001;
 
     // V0.19: scelta più veloce/più breve + toggle autostrade/superstrade + distanza senza blocco a 999 m
-    private static final double OFF_ROUTE_RECALC_METERS = 14.0;
+    // V0.27: off-route is now informational only. The original route is preserved
+    // until the user explicitly asks for a recalculation.
     private static final double OFF_ROUTE_WARN_METERS = 24.0;
-    private static final long RECALC_COOLDOWN_MS = 1200;
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
     private static final long HEARTBEAT_MS = 1000;
@@ -137,26 +139,15 @@ public class NavigationService extends Service {
                 synchronized (route) { empty = route.isEmpty(); }
 
                 if (empty) {
+                    // Only the initial route is calculated automatically.
                     requestRoute(false);
                 } else {
-                    // Important on Redmi/MIUI: when the display is off, GPS callbacks can
-                    // become less frequent even though the foreground service is alive.
-                    // The heartbeat therefore performs the same off-route/reroute decision
-                    // as a real LocationListener callback instead of merely repainting the
-                    // old route. This fixes reroutes that only appeared after unlocking.
+                    // V0.27: with the screen off we still refresh GPS state and keep sending
+                    // navigation data to the Carlyle every second, but NEVER recalculate
+                    // automatically. If we leave the route, the watch shows FUORI ROTTA and
+                    // the original route remains loaded until the user presses RICALCOLA ROTTA.
                     updateOffRouteDistance();
-                    long now = System.currentTimeMillis();
-                    boolean offRoute = offRouteMeters > OFF_ROUTE_RECALC_METERS;
-                    boolean cooldownPassed = now - lastRouteMs > RECALC_COOLDOWN_MS;
-
-                    // V0.25: no periodic route recalculation. A new ORS route is requested
-                    // only when the device is actually off-route (or when the route is empty).
-                    // Normal GPS/Carlyle updates continue without consuming routing quota.
-                    if (offRoute && cooldownPassed) {
-                        requestRoute(true);
-                    } else {
-                        sendNavUpdate(false);
-                    }
+                    sendNavUpdate(false);
                 }
             }
 
@@ -183,11 +174,30 @@ public class NavigationService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent != null ? intent.getAction() : ACTION_START;
 
+        if (ACTION_CLEAR_ROUTE.equals(action)) {
+            clearActiveRoute();
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
         if (ACTION_STOP.equals(action)) {
             stopRouting();
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
+        }
+
+        if (ACTION_REROUTE.equals(action)) {
+            startForegroundCompat("Navigazione attiva", "GPS e invio dati al Carlyle attivi");
+            if (!running) {
+                // If Android had recreated the service, restore the active navigation first.
+                startRouting();
+            } else {
+                updatePlannedWaypointProgress();
+                requestRoute(true);
+            }
+            return START_STICKY;
         }
 
         startForegroundCompat("Navigazione attiva", "GPS e invio dati al Carlyle attivi");
@@ -245,7 +255,7 @@ public class NavigationService extends Service {
 
             if (currentLocation != null) {
                 updateNotification("GPS disponibile", "Calcolo rotta...");
-                requestRoute(true);
+                requestRoute(false);
             } else {
                 updateNotification("Navigazione attiva", "Attendo GPS del telefono...");
             }
@@ -270,10 +280,35 @@ public class NavigationService extends Service {
         sendToWear("{\"mode\":\"STOP\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,140;120,70\"}");
     }
 
+    private void clearActiveRoute() {
+        running = false;
+        routeRequestInProgress = false;
+        handler.removeCallbacks(heartbeat);
+        releaseWakeLock();
+        try { locationManager.removeUpdates(listener); } catch (Exception ignored) {}
+
+        synchronized (route) { route.clear(); }
+        synchronized (maneuvers) { maneuvers.clear(); }
+        synchronized (contextRoads) { contextRoads.clear(); }
+        offRouteMeters = 0;
+        lastSendMs = 0;
+
+        updateNotification("Percorso cancellato", "In attesa di una nuova navigazione");
+        sendToWear("{\"mode\":\"WAIT\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,164;120,120\"}");
+    }
+
 
     @Override
     public void onDestroy() {
-        stopRouting();
+        // ACTION_CLEAR_ROUTE already sent WAIT to the Carlyle. Do not overwrite it
+        // with STOP while the service is shutting down.
+        if (running) {
+            stopRouting();
+        } else {
+            handler.removeCallbacks(heartbeat);
+            releaseWakeLock();
+            try { locationManager.removeUpdates(listener); } catch (Exception ignored) {}
+        }
         super.onDestroy();
     }
 
@@ -282,24 +317,15 @@ public class NavigationService extends Service {
         updatePlannedWaypointProgress();
         if (!running) return;
 
-        long now = System.currentTimeMillis();
-
         if (route.isEmpty()) {
-            requestRoute(true);
+            requestRoute(false);
             return;
         }
 
+        // V0.27: never change the route automatically. This keeps navigation predictable
+        // and avoids quota consumption caused by GPS drift or parallel roads.
         updateOffRouteDistance();
-
-        boolean offRoute = offRouteMeters > OFF_ROUTE_RECALC_METERS;
-        boolean cooldownPassed = now - lastRouteMs > RECALC_COOLDOWN_MS;
-
-        // V0.25: do not burn ORS quota with a timed refresh while we are on-route.
-        if (offRoute && cooldownPassed) {
-            requestRoute(true);
-        } else {
-            sendNavUpdate(false);
-        }
+        sendNavUpdate(false);
     };
 
     private void updateOffRouteDistance() {

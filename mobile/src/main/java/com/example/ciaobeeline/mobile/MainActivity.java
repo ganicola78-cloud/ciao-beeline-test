@@ -7,6 +7,12 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Point;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.drawable.BitmapDrawable;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -95,6 +101,15 @@ public class MainActivity extends Activity {
     private boolean allowFastRoads = false;
     private MapView routeMap;
     private MapEventsOverlay mapEventsOverlay;
+    private Marker currentLocationMarker;
+    private LocationManager mapLocationManager;
+    private Location lastMapLocation;
+    private boolean mapCenteredOnGpsOnce = false;
+
+    private final LocationListener mapLocationListener = location -> {
+        lastMapLocation = location;
+        updateCurrentLocationMarker(location);
+    };
     private LinearLayout favoritesContainer;
     private LinearLayout savedPointsContainer;
     private LinearLayout savedRoutesContainer;
@@ -109,8 +124,6 @@ public class MainActivity extends Activity {
     @Override
     public void onCreate(Bundle b) {
         super.onCreate(b);
-
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         Configuration.getInstance().load(getApplicationContext(), getSharedPreferences("osmdroid", MODE_PRIVATE));
         Configuration.getInstance().setUserAgentValue("CiaoBeeline/1.0 (Android; com.example.ciaobeeline.mobile)");
@@ -227,6 +240,14 @@ public class MainActivity extends Activity {
         start.setText("START LIVE ROUTING");
         root.addView(start);
 
+        Button reroute = new Button(this);
+        reroute.setText("RICALCOLA ROTTA");
+        root.addView(reroute);
+
+        Button clearRoute = new Button(this);
+        clearRoute.setText("CANCELLA PERCORSO");
+        root.addView(clearRoute);
+
         Button stop = new Button(this);
         stop.setText("STOP");
         root.addView(stop);
@@ -246,6 +267,7 @@ public class MainActivity extends Activity {
 
         routeMap = new MapView(this);
         routeMap.setTileSource(CIAO_OSM);
+        mapLocationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
         routeMap.setMultiTouchControls(true);
 
         // Quando il dito è sulla mappa, impedisce allo ScrollView
@@ -336,6 +358,8 @@ public class MainActivity extends Activity {
 
         preview.setOnClickListener(v -> showRoutePreviewOnMap());
         start.setOnClickListener(v -> startRoutingService());
+        reroute.setOnClickListener(v -> requestManualReroute());
+        clearRoute.setOnClickListener(v -> clearCurrentRoute());
         stop.setOnClickListener(v -> stopRoutingService());
         test.setOnClickListener(v -> sendDemo());
         battery.setOnClickListener(v -> openBatteryOptimizationSettings());
@@ -349,10 +373,102 @@ public class MainActivity extends Activity {
             return;
         }
 
+        startMapLocationUpdates();
+
         if (android.os.Build.VERSION.SDK_INT >= 33 &&
                 checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 6);
         }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 5 && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startMapLocationUpdates();
+        }
+    }
+
+    private void startMapLocationUpdates() {
+        if (routeMap == null) return;
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return;
+        if (mapLocationManager == null) mapLocationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
+        if (mapLocationManager == null) return;
+
+        try { mapLocationManager.removeUpdates(mapLocationListener); } catch (Exception ignored) {}
+
+        Location last = bestLastLocation(mapLocationManager);
+        if (last != null) {
+            lastMapLocation = last;
+            updateCurrentLocationMarker(last);
+        }
+
+        try { mapLocationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000, 0, mapLocationListener); } catch (Exception ignored) {}
+        try { mapLocationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1500, 0, mapLocationListener); } catch (Exception ignored) {}
+    }
+
+    private void stopMapLocationUpdates() {
+        if (mapLocationManager == null) return;
+        try { mapLocationManager.removeUpdates(mapLocationListener); } catch (Exception ignored) {}
+    }
+
+    private BitmapDrawable createGpsArrowIcon() {
+        float density = getResources().getDisplayMetrics().density;
+        int size = Math.max(48, Math.round(48f * density));
+        Bitmap bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+
+        Path arrow = new Path();
+        arrow.moveTo(size * 0.50f, size * 0.07f);
+        arrow.lineTo(size * 0.83f, size * 0.86f);
+        arrow.lineTo(size * 0.50f, size * 0.70f);
+        arrow.lineTo(size * 0.17f, size * 0.86f);
+        arrow.close();
+
+        Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fill.setStyle(Paint.Style.FILL);
+        fill.setColor(Color.rgb(211, 47, 47));
+        canvas.drawPath(arrow, fill);
+
+        Paint outline = new Paint(Paint.ANTI_ALIAS_FLAG);
+        outline.setStyle(Paint.Style.STROKE);
+        outline.setStrokeWidth(Math.max(2f, density * 2f));
+        outline.setColor(Color.WHITE);
+        canvas.drawPath(arrow, outline);
+
+        return new BitmapDrawable(getResources(), bitmap);
+    }
+
+    private void updateCurrentLocationMarker(Location location) {
+        if (routeMap == null || location == null) return;
+
+        if (currentLocationMarker == null) {
+            currentLocationMarker = new Marker(routeMap);
+            currentLocationMarker.setIcon(createGpsArrowIcon());
+            currentLocationMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER);
+            currentLocationMarker.setTitle("Posizione GPS attuale");
+        }
+
+        GeoPoint position = new GeoPoint(location.getLatitude(), location.getLongitude());
+        currentLocationMarker.setPosition(position);
+        if (location.hasBearing()) currentLocationMarker.setRotation(location.getBearing());
+        addCurrentLocationMarkerOverlay();
+
+        if (!mapCenteredOnGpsOnce) {
+            routeMap.getController().setCenter(position);
+            routeMap.getController().setZoom(15.0);
+            mapCenteredOnGpsOnce = true;
+        }
+        routeMap.invalidate();
+    }
+
+    private void addCurrentLocationMarkerOverlay() {
+        if (routeMap == null || currentLocationMarker == null) return;
+        routeMap.getOverlays().remove(currentLocationMarker);
+        // Keep MapEventsOverlay last so long-press continues to work everywhere.
+        if (mapEventsOverlay != null) routeMap.getOverlays().remove(mapEventsOverlay);
+        routeMap.getOverlays().add(currentLocationMarker);
+        if (mapEventsOverlay != null) routeMap.getOverlays().add(mapEventsOverlay);
     }
 
     private void openBatteryOptimizationSettings() {
@@ -1361,8 +1477,10 @@ public class MainActivity extends Activity {
         // In osmdroid gli overlay aggiunti per ultimi ricevono per primi i touch:
         // così la pressione lunga arriva a MapEventsOverlay anche se il dito è sul marker.
         addSelectedPointMarkers();
+        addCurrentLocationMarkerOverlay();
 
         if (mapEventsOverlay != null) {
+            routeMap.getOverlays().remove(mapEventsOverlay);
             routeMap.getOverlays().add(mapEventsOverlay);
         }
 
@@ -1592,9 +1710,11 @@ public class MainActivity extends Activity {
 
         // Ridisegna partenza, waypoint e arrivo sopra la linea.
         addSelectedPointMarkers();
+        addCurrentLocationMarkerOverlay();
 
         // Deve stare per ultimo: così intercetta la pressione lunga anche sopra i marker.
         if (mapEventsOverlay != null) {
+            routeMap.getOverlays().remove(mapEventsOverlay);
             routeMap.getOverlays().add(mapEventsOverlay);
         }
 
@@ -1634,9 +1754,11 @@ public class MainActivity extends Activity {
         endMarker.setPosition(new GeoPoint(dest.lat, dest.lon));
         endMarker.setTitle("Arrivo");
         routeMap.getOverlays().add(endMarker);
+        addCurrentLocationMarkerOverlay();
 
         // Deve stare per ultimo per ricevere il long-press prima dei marker.
         if (mapEventsOverlay != null) {
+            routeMap.getOverlays().remove(mapEventsOverlay);
             routeMap.getOverlays().add(mapEventsOverlay);
         }
 
@@ -1736,6 +1858,51 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void requestManualReroute() {
+        if (currentApiKey().length() < 8) {
+            status.setText("Inserisci API key OpenRouteService.");
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            status.setText("Concedi il permesso posizione.");
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 5);
+            return;
+        }
+
+        Intent i = new Intent(this, NavigationService.class);
+        i.setAction(NavigationService.ACTION_REROUTE);
+        if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+        else startService(i);
+        status.setText("Ricalcolo manuale richiesto.");
+    }
+
+    private void clearCurrentRoute() {
+        Intent i = new Intent(this, NavigationService.class);
+        i.setAction(NavigationService.ACTION_CLEAR_ROUTE);
+        try { startService(i); } catch (Exception ignored) {}
+
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_NAV_SOURCE, "text")
+                .putString(PREF_NAV_ROUTE_POINTS, "[]")
+                .putString(PREF_NAV_TARGET_LABEL, "")
+                .putString(PREF_NAV_TARGET_LAT, "")
+                .putString(PREF_NAV_TARGET_LON, "")
+                .apply();
+
+        selectedRoutePoints.clear();
+        lastSelectedPointIndex = -1;
+        if (routeMap != null) {
+            routeMap.getOverlays().clear();
+            addCurrentLocationMarkerOverlay();
+            if (mapEventsOverlay != null) {
+                routeMap.getOverlays().remove(mapEventsOverlay);
+                routeMap.getOverlays().add(mapEventsOverlay);
+            }
+            routeMap.invalidate();
+        }
+        status.setText("Percorso cancellato. Preferiti, punti e tragitti salvati restano disponibili.");
+    }
+
     private void stopRoutingService() {
         Intent i = new Intent(this, NavigationService.class);
         i.setAction(NavigationService.ACTION_STOP);
@@ -1748,10 +1915,12 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (routeMap != null) routeMap.onResume();
+        startMapLocationUpdates();
     }
 
     @Override
     protected void onPause() {
+        stopMapLocationUpdates();
         if (routeMap != null) routeMap.onPause();
         super.onPause();
     }
