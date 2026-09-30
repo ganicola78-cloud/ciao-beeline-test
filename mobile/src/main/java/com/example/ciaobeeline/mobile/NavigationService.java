@@ -85,6 +85,13 @@ public class NavigationService extends Service {
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
     private static final long HEARTBEAT_MS = 1000;
+    // V0.30: the heartbeat is only a fallback. When real GPS callbacks are arriving,
+    // avoid doing the same route matching / Wear transfer twice.
+    private static final long HEARTBEAT_FALLBACK_AFTER_MS = 900;
+    // Prefer real GPS fixes over NETWORK_PROVIDER fixes, which often have no useful speed
+    // and were able to overwrite the current GPS speed in previous versions.
+    private static final long FRESH_GPS_PRIORITY_MS = 2500;
+    private static final long NOTIFICATION_REFRESH_MS = 2000;
     private static final long CONTEXT_ROADS_REFRESH_MS = 30000;
     private static final long CONTEXT_ROADS_MIN_REFRESH_MS = 10000;
     private static final double CONTEXT_ROADS_REFRESH_DISTANCE_M = 140.0;
@@ -109,6 +116,9 @@ public class NavigationService extends Service {
     private boolean routeRequestInProgress = false;
     private long lastRouteMs = 0;
     private long lastSendMs = 0;
+    private long lastLocationCallbackMs = 0;
+    private long lastGpsFixAcceptedMs = 0;
+    private long lastNotificationRefreshMs = 0;
     private double offRouteMeters = 9999;
     private long offRouteSinceMs = 0;
     private boolean offRouteConfirmed = false;
@@ -156,14 +166,28 @@ public class NavigationService extends Service {
                     network = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
                 }
 
-                Location last = bestLocation(gps, network);
+                Location last;
+                // Prefer a GPS fix when it is only slightly older than the network fix: GPS
+                // normally carries the useful speed/bearing data needed by the Carlyle.
+                if (gps != null && network != null && gps.getTime() + FRESH_GPS_PRIORITY_MS >= network.getTime()) {
+                    last = gps;
+                } else {
+                    last = bestLocation(gps, network);
+                }
                 if (last != null && (currentLocation == null || last.getTime() >= currentLocation.getTime())) {
                     currentLocation = last;
                 }
             } catch (Exception ignored) {
             }
 
-            if (currentLocation != null) {
+            // V0.30: do not duplicate the expensive navigation pipeline when a real
+            // location callback has just arrived. The heartbeat remains active as the
+            // screen-off safety net if Android slows/stops callbacks.
+            long heartbeatNow = System.currentTimeMillis();
+            boolean recentLocationCallback =
+                    lastLocationCallbackMs > 0 && heartbeatNow - lastLocationCallbackMs < HEARTBEAT_FALLBACK_AFTER_MS;
+
+            if (currentLocation != null && !recentLocationCallback) {
                 updatePlannedWaypointProgress();
                 boolean empty;
                 synchronized (route) { empty = route.isEmpty(); }
@@ -172,11 +196,11 @@ public class NavigationService extends Service {
                     // Initial route calculation.
                     requestRoute(false);
                 } else {
-                    // V0.29: the same deviation logic runs while the display is off.
-                    // V0.28 tolerance is preserved; real wrong turns can now be recognised
-                    // sooner from bearing + distance trend, without extra API requests.
                     updateOffRouteStateAndMaybeReroute();
-                    if (!routeRequestInProgress) sendNavUpdate(false);
+                    // Keep speed/distance/line flowing even while ORS is calculating a
+                    // replacement route. The old route remains valid until the new one
+                    // is atomically installed.
+                    sendNavUpdate(false);
                 }
             }
 
@@ -256,6 +280,9 @@ public class NavigationService extends Service {
         lastDestinationText = "";
         lastRouteMs = 0;
         lastSendMs = 0;
+        lastLocationCallbackMs = 0;
+        lastGpsFixAcceptedMs = 0;
+        lastNotificationRefreshMs = 0;
         offRouteMeters = 9999;
         offRouteSinceMs = 0;
         offRouteConfirmed = false;
@@ -350,18 +377,49 @@ public class NavigationService extends Service {
     }
 
     private final LocationListener listener = loc -> {
+        if (!acceptLiveLocation(loc)) return;
+
         currentLocation = loc;
+        long now = System.currentTimeMillis();
+        lastLocationCallbackMs = now;
+        if (LocationManager.GPS_PROVIDER.equals(loc.getProvider())) {
+            lastGpsFixAcceptedMs = now;
+        }
+
         updatePlannedWaypointProgress();
         if (!running) return;
 
-        if (route.isEmpty()) {
+        boolean empty;
+        synchronized (route) { empty = route.isEmpty(); }
+        if (empty) {
             requestRoute(false);
             return;
         }
 
         updateOffRouteStateAndMaybeReroute();
-        if (!routeRequestInProgress) sendNavUpdate(false);
+        // V0.30: never freeze the Carlyle while a reroute HTTP request is in flight.
+        sendNavUpdate(false);
     };
+
+    private boolean acceptLiveLocation(Location loc) {
+        if (loc == null) return false;
+        long now = System.currentTimeMillis();
+        String provider = loc.getProvider();
+
+        // NETWORK_PROVIDER frequently reports speed=0 / no bearing. If a real GPS fix
+        // was accepted recently, keep using it instead of replacing it with the coarser fix.
+        if (LocationManager.NETWORK_PROVIDER.equals(provider) &&
+                lastGpsFixAcceptedMs > 0 && now - lastGpsFixAcceptedMs < FRESH_GPS_PRIORITY_MS) {
+            return false;
+        }
+
+        // Reject clearly older fixes arriving out of order.
+        if (currentLocation != null && loc.getTime() > 0 && currentLocation.getTime() > 0 &&
+                loc.getTime() + 1000 < currentLocation.getTime()) {
+            return false;
+        }
+        return true;
+    }
 
     private void updateOffRouteStateAndMaybeReroute() {
         if (currentLocation == null) return;
@@ -561,7 +619,12 @@ public class NavigationService extends Service {
 
         if (forceStatus) {
             updateNotification("Ricalcolo rotta", navigationLabel());
-            sendToWear("{\"mode\":\"REROUTE\",\"speed\":0,\"dist\":0,\"turn\":\"STRAIGHT\",\"limit\":" + lastSpeedLimit + ",\"line\":\"120,140;120,105;120,70;120,40\"}");
+            // V0.29 sent a synthetic REROUTE packet with speed=0 and then stopped all
+            // live packets until ORS replied. That made speed disappear and made the
+            // Carlyle look frozen. Keep the old route visible and continue live data.
+            boolean hasRoute;
+            synchronized (route) { hasRoute = !route.isEmpty(); }
+            if (hasRoute) sendNavUpdate(true);
         }
 
         new Thread(() -> {
@@ -808,7 +871,9 @@ public class NavigationService extends Service {
 
         try {
             JSONObject o = new JSONObject();
-            o.put("mode", offRouteConfirmed ? "OFF_ROUTE" : "NAV");
+            String liveMode = routeRequestInProgress ? "REROUTE" :
+                    (offRouteConfirmed ? "OFF_ROUTE" : "NAV");
+            o.put("mode", liveMode);
             o.put("seq", ++navSeq);
             o.put("recalculated", recalculated);
             o.put("speed", Math.round(speedKmh));
@@ -820,7 +885,18 @@ public class NavigationService extends Service {
             o.put("roads", roads);
 
             sendToWear(o.toString());
-            updateNotification(offRouteConfirmed ? "Fuori rotta" : "Navigazione attiva", Math.round(speedKmh) + " km/h - " + turn + " " + Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " + Math.round(offRouteMeters) + " m" + (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
+
+            // NotificationManager updates are much heavier than drawing a Wear packet.
+            // Throttle only the phone notification; navigation packets remain live.
+            if (recalculated || now - lastNotificationRefreshMs >= NOTIFICATION_REFRESH_MS) {
+                lastNotificationRefreshMs = now;
+                String title = routeRequestInProgress ? "Ricalcolo rotta" :
+                        (offRouteConfirmed ? "Fuori rotta" : "Navigazione attiva");
+                updateNotification(title, Math.round(speedKmh) + " km/h - " + turn + " " +
+                        Math.round(Math.max(0, Math.min(99999, dist))) + " m - off " +
+                        Math.round(offRouteMeters) + " m" +
+                        (lastSpeedLimit > 0 ? " - lim " + lastSpeedLimit : ""));
+            }
         } catch (JSONException ignored) {}
     }
 
