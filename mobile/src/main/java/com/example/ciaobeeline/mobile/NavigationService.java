@@ -56,13 +56,32 @@ public class NavigationService extends Service {
     private static final String CHANNEL_ID = "ciao_beeline_navigation";
     private static final int NOTIFICATION_ID = 1001;
 
-    // V0.28: map-matching + automatic reroute with hysteresis.
-    // Normal GPS/map disagreement is tolerated; a real deviation must stay beyond
-    // the confirmation threshold for several seconds before a new ORS request is sent.
+    // V0.29: keep V0.28 GPS/map tolerance unchanged, but recognise a real wrong turn
+    // faster by combining distance from the route, movement direction and distance trend.
     private static final double OFF_ROUTE_RESET_METERS = 25.0;
     private static final double OFF_ROUTE_CONFIRM_METERS = 35.0;
     private static final long OFF_ROUTE_CONFIRM_MS = 5000;
     private static final long AUTO_REROUTE_COOLDOWN_MS = 30000;
+
+    // Fast reroute: used only when GPS bearing is reliable. It does NOT reduce the
+    // visual/map-matching tolerance; it only shortens the time needed to confirm a real deviation.
+    private static final double FAST_DEVIATION_MIN_METERS = 25.0;
+    private static final long FAST_DEVIATION_CONFIRM_MS = 2000;
+    private static final double FAST_HEADING_DIFF_DEG = 45.0;
+    private static final double FAST_DISTANCE_GROWTH_METERS = 2.0;
+
+    // Missed-turn detector: when we are essentially at the manoeuvre, moving in a
+    // direction incompatible with the route and already drifting away, confirm sooner.
+    private static final double MISSED_TURN_MIN_METERS = 18.0;
+    private static final double MISSED_TURN_ROUTE_DISTANCE_METERS = 10.0;
+    private static final double MISSED_TURN_HEADING_DIFF_DEG = 55.0;
+    private static final long MISSED_TURN_CONFIRM_MS = 1500;
+
+    // A very clear deviation gets an even shorter confirmation, still requiring a
+    // reliable moving bearing so that one poor stationary GPS fix cannot consume quota.
+    private static final double HARD_DEVIATION_METERS = 50.0;
+    private static final long HARD_DEVIATION_CONFIRM_MS = 1000;
+    private static final double FAST_GPS_MAX_ACCURACY_METERS = 30.0;
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
     private static final long HEARTBEAT_MS = 1000;
@@ -94,6 +113,11 @@ public class NavigationService extends Service {
     private long offRouteSinceMs = 0;
     private boolean offRouteConfirmed = false;
     private long lastAutoRerouteMs = 0;
+    private long fastDeviationSinceMs = 0;
+    private long missedTurnSinceMs = 0;
+    private long hardDeviationSinceMs = 0;
+    private double previousOffRouteMeters = Double.NaN;
+    private long previousDeviationLocationTime = 0;
     private int lastSpeedLimit = -1;
     private long lastSpeedLimitMs = 0;
     private boolean speedLimitRequestInProgress = false;
@@ -148,9 +172,9 @@ public class NavigationService extends Service {
                     // Initial route calculation.
                     requestRoute(false);
                 } else {
-                    // V0.28: this same logic runs while the display is off. A deviation must
-                    // remain >35 m for 5 seconds before one automatic recalculation is started.
-                    // GPS drift inside the tolerance never consumes an ORS request.
+                    // V0.29: the same deviation logic runs while the display is off.
+                    // V0.28 tolerance is preserved; real wrong turns can now be recognised
+                    // sooner from bearing + distance trend, without extra API requests.
                     updateOffRouteStateAndMaybeReroute();
                     if (!routeRequestInProgress) sendNavUpdate(false);
                 }
@@ -236,6 +260,7 @@ public class NavigationService extends Service {
         offRouteSinceMs = 0;
         offRouteConfirmed = false;
         lastAutoRerouteMs = 0;
+        resetFastDeviationTracking();
         lastSpeedLimit = -1;
         lastSpeedLimitMs = 0;
         speedLimitRequestInProgress = false;
@@ -302,6 +327,7 @@ public class NavigationService extends Service {
         offRouteSinceMs = 0;
         offRouteConfirmed = false;
         lastAutoRerouteMs = 0;
+        resetFastDeviationTracking();
         lastSendMs = 0;
 
         updateNotification("Percorso cancellato", "In attesa di una nuova navigazione");
@@ -350,18 +376,33 @@ public class NavigationService extends Service {
         offRouteMeters = match.offMeters;
 
         long now = System.currentTimeMillis();
+        long locationTime = currentLocation.getTime();
+        boolean freshLocationSample = locationTime > 0 && locationTime != previousDeviationLocationTime;
+        double previousOff = previousOffRouteMeters;
 
-        // Back close to the route: clear the off-route episode. This hysteresis prevents
-        // 25-35 m GPS jitter from repeatedly arming/disarming the reroute timer.
+        if (freshLocationSample) {
+            previousOffRouteMeters = offRouteMeters;
+            previousDeviationLocationTime = locationTime;
+        }
+
+        // Back close to the route: clear every deviation detector. This keeps exactly
+        // the V0.28 hysteresis that proved stable in real use.
         if (offRouteMeters <= OFF_ROUTE_RESET_METERS) {
             offRouteSinceMs = 0;
             offRouteConfirmed = false;
+            resetFastDeviationTracking();
             return;
         }
 
-        // 25-35 m is a tolerance band: keep the visual navigation snapped to the route
-        // and do not start a recalculation timer. If already confirmed, keep OFF_ROUTE
-        // until we really return inside the reset band.
+        // Before falling back to the conservative 35 m / 5 s rule, try the faster
+        // detector. It is allowed to act only with a reliable moving GPS bearing and
+        // fresh location samples, so ordinary 10-20 m GPS/map disagreement is ignored.
+        if (evaluateFastDeviationAndMaybeReroute(copy, match, now, freshLocationSample, previousOff)) {
+            return;
+        }
+
+        // 25-35 m remains the normal tolerance band. No timer is started here unless
+        // the fast detector has multiple independent clues that a turn was really missed.
         if (offRouteMeters < OFF_ROUTE_CONFIRM_METERS) {
             if (!offRouteConfirmed) offRouteSinceMs = 0;
             return;
@@ -371,14 +412,122 @@ public class NavigationService extends Service {
         if (now - offRouteSinceMs < OFF_ROUTE_CONFIRM_MS) return;
 
         offRouteConfirmed = true;
+        startAutomaticReroute(now);
+    }
 
-        // First real deviation: reroute automatically. Cooldown prevents repeated quota
-        // consumption if ORS fails or the GPS remains poor. Manual RICALCOLA still bypasses
-        // this guard because ACTION_REROUTE calls requestRoute() directly.
-        if (!routeRequestInProgress && now - lastAutoRerouteMs >= AUTO_REROUTE_COOLDOWN_MS) {
-            lastAutoRerouteMs = now;
-            requestRoute(true);
+    private boolean evaluateFastDeviationAndMaybeReroute(ArrayList<LatLon> copy, RouteMatch match,
+                                                          long now, boolean freshLocationSample,
+                                                          double previousOff) {
+        if (!freshLocationSample) return false;
+
+        float speedKmh = currentLocation.hasSpeed() ? Math.max(0, currentLocation.getSpeed() * 3.6f) : 0;
+        boolean accuracyOk = !currentLocation.hasAccuracy() || currentLocation.getAccuracy() <= FAST_GPS_MAX_ACCURACY_METERS;
+        boolean bearingOk = currentLocation.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH && accuracyOk;
+
+        if (!bearingOk) {
+            fastDeviationSinceMs = 0;
+            missedTurnSinceMs = 0;
+            hardDeviationSinceMs = 0;
+            return false;
         }
+
+        double expectedBearing = routeHeadingAhead(copy, match, 35.0);
+        if (Double.isNaN(expectedBearing)) {
+            fastDeviationSinceMs = 0;
+            missedTurnSinceMs = 0;
+            hardDeviationSinceMs = 0;
+            return false;
+        }
+
+        double headingDiff = Math.abs(angleDiff(currentLocation.getBearing(), expectedBearing));
+        boolean growing = !Double.isNaN(previousOff) &&
+                offRouteMeters >= previousOff + FAST_DISTANCE_GROWTH_METERS;
+
+        // 1) Very clear deviation: >=50 m and direction incompatible with the route.
+        // Confirm for one second rather than firing on one isolated fix.
+        if (offRouteMeters >= HARD_DEVIATION_METERS && headingDiff >= FAST_HEADING_DIFF_DEG) {
+            if (hardDeviationSinceMs == 0) hardDeviationSinceMs = now;
+            if (now - hardDeviationSinceMs >= HARD_DEVIATION_CONFIRM_MS) {
+                offRouteConfirmed = true;
+                return startAutomaticReroute(now);
+            }
+        } else {
+            hardDeviationSinceMs = 0;
+        }
+
+        // 2) Generic fast deviation: >=25 m, clearly wrong heading and distance growing.
+        // Once armed, a nearly-flat sample is tolerated, but a real movement back toward
+        // the route cancels the timer. This is quicker without becoming sensitive to jitter.
+        boolean notShrinking = !Double.isNaN(previousOff) && offRouteMeters >= previousOff - 1.0;
+        boolean fastCondition = offRouteMeters >= FAST_DEVIATION_MIN_METERS &&
+                headingDiff >= FAST_HEADING_DIFF_DEG &&
+                (growing || (fastDeviationSinceMs != 0 && notShrinking));
+
+        if (fastCondition) {
+            if (fastDeviationSinceMs == 0) fastDeviationSinceMs = now;
+            if (now - fastDeviationSinceMs >= FAST_DEVIATION_CONFIRM_MS) {
+                offRouteConfirmed = true;
+                return startAutomaticReroute(now);
+            }
+        } else {
+            fastDeviationSinceMs = 0;
+        }
+
+        // 3) Missed-turn detector. If the next real manoeuvre is essentially at the
+        // current matched point, the bike/car is already >=18 m off the route and the
+        // bearing differs strongly, we can confirm sooner than the generic 5 s rule.
+        int distanceToTurn = distanceToNextRealManeuver(copy, match.index);
+        boolean atMissedTurn = distanceToTurn >= 0 &&
+                distanceToTurn <= MISSED_TURN_ROUTE_DISTANCE_METERS &&
+                offRouteMeters >= MISSED_TURN_MIN_METERS &&
+                headingDiff >= MISSED_TURN_HEADING_DIFF_DEG &&
+                (growing || offRouteMeters >= FAST_DEVIATION_MIN_METERS);
+
+        if (atMissedTurn) {
+            if (missedTurnSinceMs == 0) missedTurnSinceMs = now;
+            if (now - missedTurnSinceMs >= MISSED_TURN_CONFIRM_MS) {
+                offRouteConfirmed = true;
+                return startAutomaticReroute(now);
+            }
+        } else {
+            missedTurnSinceMs = 0;
+        }
+
+        return false;
+    }
+
+    private int distanceToNextRealManeuver(ArrayList<LatLon> copy, int nearestRouteIndex) {
+        ArrayList<Maneuver> manCopy;
+        synchronized (maneuvers) {
+            manCopy = new ArrayList<>(maneuvers);
+        }
+
+        for (Maneuver m : manCopy) {
+            if (m.startIndex + 2 < nearestRouteIndex) continue;
+            // Ignore goal, departure and straight steps: this detector is only for
+            // an actual turn/keep/roundabout/U-turn that could have been missed.
+            if (m.type == 10 || m.type == 11 || m.type == 6) continue;
+            return distanceAlongRoute(copy, nearestRouteIndex, m.startIndex);
+        }
+
+        return -1;
+    }
+
+    private boolean startAutomaticReroute(long now) {
+        if (routeRequestInProgress) return false;
+        if (now - lastAutoRerouteMs < AUTO_REROUTE_COOLDOWN_MS) return false;
+
+        lastAutoRerouteMs = now;
+        requestRoute(true);
+        return true;
+    }
+
+    private void resetFastDeviationTracking() {
+        fastDeviationSinceMs = 0;
+        missedTurnSinceMs = 0;
+        hardDeviationSinceMs = 0;
+        previousOffRouteMeters = Double.NaN;
+        previousDeviationLocationTime = 0;
     }
 
     private void requestRoute(boolean forceStatus) {
@@ -449,6 +598,7 @@ public class NavigationService extends Service {
                     offRouteSinceMs = 0;
                     offRouteConfirmed = false;
                     offRouteMeters = 0;
+                    resetFastDeviationTracking();
                     updateNotification("Rotta aggiornata", navigationLabel() + " - " +
                             ("shortest".equals(routeMode) ? "breve" : "veloce") +
                             (allowFastRoads ? " + strade veloci" : " no autostrade") +
@@ -1287,6 +1437,33 @@ public class NavigationService extends Service {
         int b = Math.min(idx + 6, pts.size() - 1);
         if (a == b) return 0;
         return bearing(pts.get(a).lat, pts.get(a).lon, pts.get(b).lat, pts.get(b).lon);
+    }
+
+    private static double routeHeadingAhead(ArrayList<LatLon> pts, RouteMatch match, double lookAheadMeters) {
+        if (pts == null || pts.size() < 2 || match == null) return Double.NaN;
+
+        int idx = Math.max(0, Math.min(match.index, pts.size() - 2));
+        double startLat = match.lat;
+        double startLon = match.lon;
+        double prevLat = startLat;
+        double prevLon = startLon;
+        double acc = 0;
+        LatLon target = null;
+
+        for (int i = idx + 1; i < pts.size(); i++) {
+            LatLon p = pts.get(i);
+            acc += distanceMeters(prevLat, prevLon, p.lat, p.lon);
+            target = p;
+            if (acc >= lookAheadMeters) break;
+            prevLat = p.lat;
+            prevLon = p.lon;
+        }
+
+        if (target == null || distanceMeters(startLat, startLon, target.lat, target.lon) < 2.0) {
+            return Double.NaN;
+        }
+
+        return bearing(startLat, startLon, target.lat, target.lon);
     }
 
     private static String inferTurn(ArrayList<LatLon> pts, int idx) {
