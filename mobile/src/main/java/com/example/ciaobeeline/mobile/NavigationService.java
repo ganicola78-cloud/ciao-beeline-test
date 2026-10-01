@@ -61,7 +61,7 @@ public class NavigationService extends Service {
     private static final double OFF_ROUTE_RESET_METERS = 25.0;
     private static final double OFF_ROUTE_CONFIRM_METERS = 35.0;
     private static final long OFF_ROUTE_CONFIRM_MS = 5000;
-    private static final long AUTO_REROUTE_COOLDOWN_MS = 30000;
+    private static final long AUTO_REROUTE_COOLDOWN_MS = 10000;
 
     // Fast reroute: used only when GPS bearing is reliable. It does NOT reduce the
     // visual/map-matching tolerance; it only shortens the time needed to confirm a real deviation.
@@ -72,10 +72,12 @@ public class NavigationService extends Service {
 
     // Missed-turn detector: when we are essentially at the manoeuvre, moving in a
     // direction incompatible with the route and already drifting away, confirm sooner.
-    private static final double MISSED_TURN_MIN_METERS = 18.0;
-    private static final double MISSED_TURN_ROUTE_DISTANCE_METERS = 10.0;
-    private static final double MISSED_TURN_HEADING_DIFF_DEG = 55.0;
-    private static final long MISSED_TURN_CONFIRM_MS = 1500;
+    private static final double MISSED_TURN_MIN_METERS = 7.0;
+    private static final double MISSED_TURN_ROUTE_DISTANCE_METERS = 30.0;
+    private static final double MISSED_TURN_HEADING_DIFF_DEG = 45.0;
+    private static final long MISSED_TURN_CONFIRM_MS = 800;
+    private static final double MISSED_TURN_MOVING_AWAY_METERS = 4.0;
+    private static final int MISSED_TURN_MIN_SAMPLES = 2;
 
     // A very clear deviation gets an even shorter confirmation, still requiring a
     // reliable moving bearing so that one poor stationary GPS fix cannot consume quota.
@@ -126,6 +128,10 @@ public class NavigationService extends Service {
     private long fastDeviationSinceMs = 0;
     private long missedTurnSinceMs = 0;
     private long hardDeviationSinceMs = 0;
+    private int armedManeuverStartIndex = -1;
+    private double armedManeuverMinDistance = Double.POSITIVE_INFINITY;
+    private int missedTurnMismatchSamples = 0;
+    private boolean manualReroutePending = false;
     private double previousOffRouteMeters = Double.NaN;
     private long previousDeviationLocationTime = 0;
     private int lastSpeedLimit = -1;
@@ -247,8 +253,19 @@ public class NavigationService extends Service {
                 // If Android had recreated the service, restore the active navigation first.
                 startRouting();
             } else {
+                // Route options can be changed on the phone while the foreground service is
+                // already running. Reload them before a manual reroute so, for example,
+                // AUTOSTRADE / SUPERSTRADE: SÌ takes effect immediately.
+                reloadRoutingOptions();
                 updatePlannedWaypointProgress();
-                requestRoute(true);
+                if (routeRequestInProgress) {
+                    // Do not silently ignore the button. Queue one fresh calculation with
+                    // the newest options/current GPS position as soon as the in-flight one ends.
+                    manualReroutePending = true;
+                    updateNotification("Ricalcolo richiesto", "Attendo il calcolo già in corso...");
+                } else {
+                    requestRoute(true);
+                }
             }
             return START_STICKY;
         }
@@ -268,6 +285,7 @@ public class NavigationService extends Service {
         loadPrefsForService();
         running = true;
         routeRequestInProgress = false;
+        manualReroutePending = false;
         plannedWaypointStartIndex = 0;
         acquireWakeLock();
         handler.removeCallbacks(heartbeat);
@@ -443,19 +461,23 @@ public class NavigationService extends Service {
             previousDeviationLocationTime = locationTime;
         }
 
-        // Back close to the route: clear every deviation detector. This keeps exactly
-        // the V0.28 hysteresis that proved stable in real use.
-        if (offRouteMeters <= OFF_ROUTE_RESET_METERS) {
-            offRouteSinceMs = 0;
-            offRouteConfirmed = false;
-            resetFastDeviationTracking();
+        // Evaluate the missed-turn logic BEFORE the normal 25 m reset. This lets us
+        // arm a junction while still correctly snapped to the route and, after passing
+        // the junction in the wrong direction, react at ~7-10 m instead of waiting
+        // until the GPS is 25-35 m away. Generic deviation rules inside this method
+        // still keep their own >=25 m thresholds, so ordinary GPS jitter is unchanged.
+        if (evaluateFastDeviationAndMaybeReroute(copy, match, now, freshLocationSample, previousOff)) {
             return;
         }
 
-        // Before falling back to the conservative 35 m / 5 s rule, try the faster
-        // detector. It is allowed to act only with a reliable moving GPS bearing and
-        // fresh location samples, so ordinary 10-20 m GPS/map disagreement is ignored.
-        if (evaluateFastDeviationAndMaybeReroute(copy, match, now, freshLocationSample, previousOff)) {
+        // Back close to the route: preserve the V0.28 visual/map-matching tolerance.
+        // Do NOT wipe the armed junction here: it must survive the instant in which
+        // we cross a turn and then move a few metres away on the wrong road.
+        if (offRouteMeters <= OFF_ROUTE_RESET_METERS) {
+            offRouteSinceMs = 0;
+            offRouteConfirmed = false;
+            fastDeviationSinceMs = 0;
+            hardDeviationSinceMs = 0;
             return;
         }
 
@@ -531,30 +553,73 @@ public class NavigationService extends Service {
             fastDeviationSinceMs = 0;
         }
 
-        // 3) Missed-turn detector. If the next real manoeuvre is essentially at the
-        // current matched point, the bike/car is already >=18 m off the route and the
-        // bearing differs strongly, we can confirm sooner than the generic 5 s rule.
-        int distanceToTurn = distanceToNextRealManeuver(copy, match.index);
-        boolean atMissedTurn = distanceToTurn >= 0 &&
-                distanceToTurn <= MISSED_TURN_ROUTE_DISTANCE_METERS &&
-                offRouteMeters >= MISSED_TURN_MIN_METERS &&
-                headingDiff >= MISSED_TURN_HEADING_DIFF_DEG &&
-                (growing || offRouteMeters >= FAST_DEVIATION_MIN_METERS);
+        // 3) Missed-turn detector. This is intentionally different from ordinary
+        // off-route detection: while approaching a real junction we "arm" that manoeuvre.
+        // If, after reaching it, the GPS is moving away from the junction on a heading
+        // incompatible with the outgoing route, reroute quickly even though the raw
+        // GPS may still be only a few metres from the old polyline. This is the common
+        // "I should have turned but continued straight" case.
+        Maneuver upcoming = nextRealManeuver(match.index);
+        if (upcoming != null && upcoming.type != 7 && upcoming.type != 8 && upcoming.type != 9) {
+            int turnIndex = Math.max(0, Math.min(upcoming.startIndex, copy.size() - 1));
+            LatLon turnPoint = copy.get(turnIndex);
+            double rawDistanceToTurn = distanceMeters(
+                    currentLocation.getLatitude(), currentLocation.getLongitude(),
+                    turnPoint.lat, turnPoint.lon);
+            int routeDistanceToTurn = distanceAlongRoute(copy, match.index, turnIndex);
 
-        if (atMissedTurn) {
-            if (missedTurnSinceMs == 0) missedTurnSinceMs = now;
-            if (now - missedTurnSinceMs >= MISSED_TURN_CONFIRM_MS) {
-                offRouteConfirmed = true;
-                return startAutomaticReroute(now);
+            boolean nearTurn = (routeDistanceToTurn >= 0 && routeDistanceToTurn <= MISSED_TURN_ROUTE_DISTANCE_METERS)
+                    || rawDistanceToTurn <= MISSED_TURN_ROUTE_DISTANCE_METERS;
+
+            if (nearTurn) {
+                if (armedManeuverStartIndex != turnIndex) {
+                    armedManeuverStartIndex = turnIndex;
+                    armedManeuverMinDistance = rawDistanceToTurn;
+                    missedTurnSinceMs = 0;
+                    missedTurnMismatchSamples = 0;
+                } else {
+                    armedManeuverMinDistance = Math.min(armedManeuverMinDistance, rawDistanceToTurn);
+                }
+            }
+
+            if (armedManeuverStartIndex == turnIndex) {
+                double outgoingBearing = routeHeadingAfterIndex(copy, turnIndex, 28.0);
+                double outgoingDiff = Double.isNaN(outgoingBearing) ? 0.0 :
+                        Math.abs(angleDiff(currentLocation.getBearing(), outgoingBearing));
+                boolean movingAwayFromTurn = rawDistanceToTurn >=
+                        armedManeuverMinDistance + MISSED_TURN_MOVING_AWAY_METERS;
+                boolean missedTurnCondition = movingAwayFromTurn
+                        && offRouteMeters >= MISSED_TURN_MIN_METERS
+                        && outgoingDiff >= MISSED_TURN_HEADING_DIFF_DEG;
+
+                if (missedTurnCondition) {
+                    if (missedTurnSinceMs == 0) missedTurnSinceMs = now;
+                    missedTurnMismatchSamples++;
+                    if (missedTurnMismatchSamples >= MISSED_TURN_MIN_SAMPLES
+                            && now - missedTurnSinceMs >= MISSED_TURN_CONFIRM_MS) {
+                        offRouteConfirmed = true;
+                        return startAutomaticReroute(now);
+                    }
+                } else {
+                    missedTurnSinceMs = 0;
+                    missedTurnMismatchSamples = 0;
+                }
+
+                // Once we are well beyond the junction without a mismatch, disarm it.
+                if (rawDistanceToTurn > 70.0 && !missedTurnCondition) {
+                    armedManeuverStartIndex = -1;
+                    armedManeuverMinDistance = Double.POSITIVE_INFINITY;
+                }
             }
         } else {
             missedTurnSinceMs = 0;
+            missedTurnMismatchSamples = 0;
         }
 
         return false;
     }
 
-    private int distanceToNextRealManeuver(ArrayList<LatLon> copy, int nearestRouteIndex) {
+    private Maneuver nextRealManeuver(int nearestRouteIndex) {
         ArrayList<Maneuver> manCopy;
         synchronized (maneuvers) {
             manCopy = new ArrayList<>(maneuvers);
@@ -562,13 +627,15 @@ public class NavigationService extends Service {
 
         for (Maneuver m : manCopy) {
             if (m.startIndex + 2 < nearestRouteIndex) continue;
-            // Ignore goal, departure and straight steps: this detector is only for
-            // an actual turn/keep/roundabout/U-turn that could have been missed.
             if (m.type == 10 || m.type == 11 || m.type == 6) continue;
-            return distanceAlongRoute(copy, nearestRouteIndex, m.startIndex);
+            return m;
         }
+        return null;
+    }
 
-        return -1;
+    private int distanceToNextRealManeuver(ArrayList<LatLon> copy, int nearestRouteIndex) {
+        Maneuver m = nextRealManeuver(nearestRouteIndex);
+        return m == null ? -1 : distanceAlongRoute(copy, nearestRouteIndex, m.startIndex);
     }
 
     private boolean startAutomaticReroute(long now) {
@@ -576,6 +643,8 @@ public class NavigationService extends Service {
         if (now - lastAutoRerouteMs < AUTO_REROUTE_COOLDOWN_MS) return false;
 
         lastAutoRerouteMs = now;
+        // Pick up route-mode/highway changes made on the phone while navigation is live.
+        reloadRoutingOptions();
         requestRoute(true);
         return true;
     }
@@ -584,6 +653,9 @@ public class NavigationService extends Service {
         fastDeviationSinceMs = 0;
         missedTurnSinceMs = 0;
         hardDeviationSinceMs = 0;
+        armedManeuverStartIndex = -1;
+        armedManeuverMinDistance = Double.POSITIVE_INFINITY;
+        missedTurnMismatchSamples = 0;
         previousOffRouteMeters = Double.NaN;
         previousDeviationLocationTime = 0;
     }
@@ -658,6 +730,8 @@ public class NavigationService extends Service {
 
                 handler.post(() -> {
                     routeRequestInProgress = false;
+                    boolean rerouteAgain = manualReroutePending;
+                    manualReroutePending = false;
                     offRouteSinceMs = 0;
                     offRouteConfirmed = false;
                     offRouteMeters = 0;
@@ -667,11 +741,21 @@ public class NavigationService extends Service {
                             (allowFastRoads ? " + strade veloci" : " no autostrade") +
                             " - svolte: " + result.maneuvers.size());
                     sendNavUpdate(true);
+                    if (rerouteAgain) {
+                        reloadRoutingOptions();
+                        handler.postDelayed(() -> requestRoute(true), 80);
+                    }
                 });
             } catch (Exception e) {
                 handler.post(() -> {
                     routeRequestInProgress = false;
+                    boolean rerouteAgain = manualReroutePending;
+                    manualReroutePending = false;
                     updateNotification("Errore routing", String.valueOf(e.getMessage()));
+                    if (rerouteAgain) {
+                        reloadRoutingOptions();
+                        handler.postDelayed(() -> requestRoute(true), 120);
+                    }
                 });
             }
         }).start();
@@ -701,6 +785,9 @@ public class NavigationService extends Service {
         URL url = new URL("https://api.heigit.org/pelias/v1/search?api_key=" + key + "&text=" + encoded + "&size=1");
 
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setConnectTimeout(5000);
+        c.setReadTimeout(7000);
+        c.setUseCaches(false);
         c.setRequestMethod("GET");
         c.setRequestProperty("Accept", "application/json");
 
@@ -750,6 +837,9 @@ public class NavigationService extends Service {
         URL url = new URL("https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson");
 
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setConnectTimeout(5000);
+        c.setReadTimeout(7000);
+        c.setUseCaches(false);
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Authorization", key);
@@ -1095,8 +1185,9 @@ public class NavigationService extends Service {
         double head = bearing(lat0, lon0, headingPoint.lat, headingPoint.lon);
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
         if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
-            double gpsHead = loc.getBearing();
-            if (Math.abs(angleDiff(head, gpsHead)) < 55.0) head = gpsHead;
+            // Keep grey context roads in exactly the same heading-up frame as the
+            // white route. Otherwise the two layers rotate differently after a wrong turn.
+            head = loc.getBearing();
         }
 
         double h = Math.toRadians(head);
@@ -1280,6 +1371,14 @@ public class NavigationService extends Service {
                 Wearable.getMessageClient(this).sendMessage(n.getId(), PATH, msg.getBytes(StandardCharsets.UTF_8));
             }
         });
+    }
+
+    private void reloadRoutingOptions() {
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        apiKey = p.getString(PREF_API_KEY, apiKey);
+        destinationText = p.getString(PREF_DESTINATION, destinationText);
+        routeMode = p.getString(PREF_ROUTE_MODE, routeMode == null ? "fastest" : routeMode);
+        allowFastRoads = p.getBoolean(PREF_ALLOW_FAST_ROADS, allowFastRoads);
     }
 
     private void loadPrefsForService() {
@@ -1542,6 +1641,24 @@ public class NavigationService extends Service {
         return bearing(startLat, startLon, target.lat, target.lon);
     }
 
+    private static double routeHeadingAfterIndex(ArrayList<LatLon> pts, int startIndex, double lookAheadMeters) {
+        if (pts == null || pts.size() < 2) return Double.NaN;
+        int start = Math.max(0, Math.min(startIndex, pts.size() - 2));
+        LatLon origin = pts.get(start);
+        LatLon prev = origin;
+        LatLon target = null;
+        double acc = 0.0;
+        for (int i = start + 1; i < pts.size(); i++) {
+            LatLon p = pts.get(i);
+            acc += distanceMeters(prev.lat, prev.lon, p.lat, p.lon);
+            target = p;
+            if (acc >= lookAheadMeters) break;
+            prev = p;
+        }
+        if (target == null || distanceMeters(origin.lat, origin.lon, target.lat, target.lon) < 2.0) return Double.NaN;
+        return bearing(origin.lat, origin.lon, target.lat, target.lon);
+    }
+
     private static String inferTurn(ArrayList<LatLon> pts, int idx) {
         if (idx + 8 >= pts.size()) return "STRAIGHT";
         int a = Math.min(idx + 3, pts.size() - 1);
@@ -1607,9 +1724,11 @@ public class NavigationService extends Service {
 
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
         if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
-            double gpsHead = loc.getBearing();
-            double diff = Math.abs(angleDiff(head, gpsHead));
-            if (diff < 55.0) head = gpsHead;
+            // Heading-up must follow the REAL direction of travel, even when that
+            // direction disagrees with the planned route (exactly what happens after
+            // a missed turn). The old 55-degree gate left the Carlyle visually rotated
+            // toward the planned road when the rider was actually going elsewhere.
+            head = loc.getBearing();
         }
 
         double h = Math.toRadians(head);

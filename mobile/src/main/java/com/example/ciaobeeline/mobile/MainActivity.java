@@ -106,9 +106,16 @@ public class MainActivity extends Activity {
     private static final double PHONE_ROUTE_SNAP_METERS = 20.0;
     private LocationManager mapLocationManager;
     private Location lastMapLocation;
+    private Location lastMapCourseLocation;
+    private long lastMapGpsFixMs = 0;
+    private float lastMapHeading = Float.NaN;
     private boolean mapCenteredOnGpsOnce = false;
 
     private final LocationListener mapLocationListener = location -> {
+        if (!acceptMapLocation(location)) return;
+        if (LocationManager.GPS_PROVIDER.equals(location.getProvider())) {
+            lastMapGpsFixMs = System.currentTimeMillis();
+        }
         lastMapLocation = location;
         updateCurrentLocationMarker(location);
     };
@@ -414,6 +421,79 @@ public class MainActivity extends Activity {
         try { mapLocationManager.removeUpdates(mapLocationListener); } catch (Exception ignored) {}
     }
 
+    private boolean acceptMapLocation(Location location) {
+        if (location == null) return false;
+        long now = System.currentTimeMillis();
+        if (LocationManager.NETWORK_PROVIDER.equals(location.getProvider())
+                && lastMapGpsFixMs > 0 && now - lastMapGpsFixMs < 3000) {
+            return false;
+        }
+        if (lastMapLocation != null && location.getTime() > 0 && lastMapLocation.getTime() > 0
+                && location.getTime() + 1000 < lastMapLocation.getTime()) {
+            return false;
+        }
+        return true;
+    }
+
+    private float resolveTravelHeading(Location location) {
+        float candidate = Float.NaN;
+        float speedKmh = location.hasSpeed() ? Math.max(0f, location.getSpeed() * 3.6f) : 0f;
+
+        // At normal riding/driving speed Android's GPS bearing is the best source.
+        if (location.hasBearing() && speedKmh >= 5f
+                && (!location.hasAccuracy() || location.getAccuracy() <= 35f)) {
+            candidate = location.getBearing();
+        } else if (lastMapCourseLocation != null) {
+            double moved = distanceMetersLocal(
+                    lastMapCourseLocation.getLatitude(), lastMapCourseLocation.getLongitude(),
+                    location.getLatitude(), location.getLongitude());
+            long dt = location.getTime() - lastMapCourseLocation.getTime();
+            if (moved >= 3.0 && dt > 0 && dt <= 6000) {
+                candidate = (float) bearingLocal(
+                        lastMapCourseLocation.getLatitude(), lastMapCourseLocation.getLongitude(),
+                        location.getLatitude(), location.getLongitude());
+            }
+        }
+
+        if (LocationManager.GPS_PROVIDER.equals(location.getProvider())) {
+            if (lastMapCourseLocation == null || distanceMetersLocal(
+                    lastMapCourseLocation.getLatitude(), lastMapCourseLocation.getLongitude(),
+                    location.getLatitude(), location.getLongitude()) >= 2.0) {
+                lastMapCourseLocation = new Location(location);
+            }
+        }
+
+        if (Float.isNaN(candidate)) return lastMapHeading;
+        if (Float.isNaN(lastMapHeading)) {
+            lastMapHeading = normalizeHeading(candidate);
+            return lastMapHeading;
+        }
+
+        // Light circular smoothing removes one-fix GPS spikes without creating the
+        // large lag that a heavy animation would cause at a junction.
+        float diff = shortestAngle(lastMapHeading, candidate);
+        lastMapHeading = normalizeHeading(lastMapHeading + diff * 0.72f);
+        return lastMapHeading;
+    }
+
+    private static float normalizeHeading(float value) {
+        float r = value % 360f;
+        return r < 0f ? r + 360f : r;
+    }
+
+    private static float shortestAngle(float from, float to) {
+        float d = (to - from + 540f) % 360f - 180f;
+        return d;
+    }
+
+    private static double bearingLocal(double la1, double lo1, double la2, double lo2) {
+        double y = Math.sin(Math.toRadians(lo2 - lo1)) * Math.cos(Math.toRadians(la2));
+        double x = Math.cos(Math.toRadians(la1)) * Math.sin(Math.toRadians(la2))
+                - Math.sin(Math.toRadians(la1)) * Math.cos(Math.toRadians(la2))
+                * Math.cos(Math.toRadians(lo2 - lo1));
+        return (Math.toDegrees(Math.atan2(y, x)) + 360.0) % 360.0;
+    }
+
     private BitmapDrawable createGpsArrowIcon() {
         float density = getResources().getDisplayMetrics().density;
         int size = Math.max(48, Math.round(48f * density));
@@ -454,7 +534,13 @@ public class MainActivity extends Activity {
         GeoPoint rawPosition = new GeoPoint(location.getLatitude(), location.getLongitude());
         GeoPoint position = snapPhonePositionToDisplayedRoute(rawPosition);
         currentLocationMarker.setPosition(position);
-        if (location.hasBearing()) currentLocationMarker.setRotation(location.getBearing());
+        float heading = resolveTravelHeading(location);
+        if (!Float.isNaN(heading)) {
+            // osmdroid internally draws a Marker with -mBearing on a north-up map,
+            // therefore the value passed to setRotation must be negated so a 90°
+            // eastbound course actually points the arrow to the right/east.
+            currentLocationMarker.setRotation(-heading);
+        }
         addCurrentLocationMarkerOverlay();
 
         if (!mapCenteredOnGpsOnce) {
