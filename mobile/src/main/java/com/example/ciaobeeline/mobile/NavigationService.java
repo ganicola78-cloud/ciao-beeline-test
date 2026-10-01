@@ -60,29 +60,37 @@ public class NavigationService extends Service {
     // faster by combining distance from the route, movement direction and distance trend.
     private static final double OFF_ROUTE_RESET_METERS = 25.0;
     private static final double OFF_ROUTE_CONFIRM_METERS = 35.0;
-    private static final long OFF_ROUTE_CONFIRM_MS = 5000;
+    private static final long OFF_ROUTE_CONFIRM_MS = 2500;
     private static final long AUTO_REROUTE_COOLDOWN_MS = 10000;
 
     // Fast reroute: used only when GPS bearing is reliable. It does NOT reduce the
     // visual/map-matching tolerance; it only shortens the time needed to confirm a real deviation.
     private static final double FAST_DEVIATION_MIN_METERS = 25.0;
-    private static final long FAST_DEVIATION_CONFIRM_MS = 2000;
+    private static final long FAST_DEVIATION_CONFIRM_MS = 1200;
     private static final double FAST_HEADING_DIFF_DEG = 45.0;
     private static final double FAST_DISTANCE_GROWTH_METERS = 2.0;
+
+    // V0.32: generic wrong-road detector independent of ORS maneuver type. This catches
+    // the common case where the rider misses a junction but the maneuver list/bearing
+    // metadata is incomplete. It does not alter the 20-25 m visual snap tolerance.
+    private static final double NEAR_WRONG_ROAD_MIN_METERS = 9.0;
+    private static final double NEAR_WRONG_ROAD_HEADING_DIFF_DEG = 55.0;
+    private static final long NEAR_WRONG_ROAD_CONFIRM_MS = 900;
+    private static final int NEAR_WRONG_ROAD_MIN_SAMPLES = 2;
 
     // Missed-turn detector: when we are essentially at the manoeuvre, moving in a
     // direction incompatible with the route and already drifting away, confirm sooner.
     private static final double MISSED_TURN_MIN_METERS = 7.0;
     private static final double MISSED_TURN_ROUTE_DISTANCE_METERS = 30.0;
     private static final double MISSED_TURN_HEADING_DIFF_DEG = 45.0;
-    private static final long MISSED_TURN_CONFIRM_MS = 800;
+    private static final long MISSED_TURN_CONFIRM_MS = 600;
     private static final double MISSED_TURN_MOVING_AWAY_METERS = 4.0;
     private static final int MISSED_TURN_MIN_SAMPLES = 2;
 
     // A very clear deviation gets an even shorter confirmation, still requiring a
     // reliable moving bearing so that one poor stationary GPS fix cannot consume quota.
     private static final double HARD_DEVIATION_METERS = 50.0;
-    private static final long HARD_DEVIATION_CONFIRM_MS = 1000;
+    private static final long HARD_DEVIATION_CONFIRM_MS = 600;
     private static final double FAST_GPS_MAX_ACCURACY_METERS = 30.0;
     private static final float GPS_BEARING_MIN_SPEED_KMH = 10.0f;
     private static final long SPEED_LIMIT_REFRESH_MS = 30000;
@@ -128,12 +136,23 @@ public class NavigationService extends Service {
     private long fastDeviationSinceMs = 0;
     private long missedTurnSinceMs = 0;
     private long hardDeviationSinceMs = 0;
+    private long nearWrongRoadSinceMs = 0;
+    private int nearWrongRoadSamples = 0;
     private int armedManeuverStartIndex = -1;
     private double armedManeuverMinDistance = Double.POSITIVE_INFINITY;
     private int missedTurnMismatchSamples = 0;
     private boolean manualReroutePending = false;
     private double previousOffRouteMeters = Double.NaN;
     private long previousDeviationLocationTime = 0;
+    // V0.32: keep route matching tied to actual forward progress. Matching against the
+    // entire polyline can latch onto a nearby future/return segment and make a real
+    // deviation look like 0-10 m, preventing reroute completely.
+    private int lastTrackingRouteIndex = 0;
+    // Some phones do not expose Location.getBearing() reliably on every fix. Derive a
+    // movement bearing from consecutive accepted fixes as a fallback for wrong-turn detection.
+    private Location lastMovementFix = null;
+    private double lastMovementBearing = Double.NaN;
+    private long lastMovementBearingMs = 0;
     private int lastSpeedLimit = -1;
     private long lastSpeedLimitMs = 0;
     private boolean speedLimitRequestInProgress = false;
@@ -306,6 +325,10 @@ public class NavigationService extends Service {
         offRouteConfirmed = false;
         lastAutoRerouteMs = 0;
         resetFastDeviationTracking();
+        lastTrackingRouteIndex = 0;
+        lastMovementFix = null;
+        lastMovementBearing = Double.NaN;
+        lastMovementBearingMs = 0;
         lastSpeedLimit = -1;
         lastSpeedLimitMs = 0;
         speedLimitRequestInProgress = false;
@@ -373,6 +396,10 @@ public class NavigationService extends Service {
         offRouteConfirmed = false;
         lastAutoRerouteMs = 0;
         resetFastDeviationTracking();
+        lastTrackingRouteIndex = 0;
+        lastMovementFix = null;
+        lastMovementBearing = Double.NaN;
+        lastMovementBearingMs = 0;
         lastSendMs = 0;
 
         updateNotification("Percorso cancellato", "In attesa di una nuova navigazione");
@@ -397,6 +424,7 @@ public class NavigationService extends Service {
     private final LocationListener listener = loc -> {
         if (!acceptLiveLocation(loc)) return;
 
+        updateMovementBearing(loc);
         currentLocation = loc;
         long now = System.currentTimeMillis();
         lastLocationCallbackMs = now;
@@ -448,7 +476,7 @@ public class NavigationService extends Service {
         }
         if (copy.isEmpty()) return;
 
-        RouteMatch match = matchRoute(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
+        RouteMatch match = matchRouteTracked(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
         offRouteMeters = match.offMeters;
 
         long now = System.currentTimeMillis();
@@ -502,12 +530,16 @@ public class NavigationService extends Service {
 
         float speedKmh = currentLocation.hasSpeed() ? Math.max(0, currentLocation.getSpeed() * 3.6f) : 0;
         boolean accuracyOk = !currentLocation.hasAccuracy() || currentLocation.getAccuracy() <= FAST_GPS_MAX_ACCURACY_METERS;
-        boolean bearingOk = currentLocation.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH && accuracyOk;
+        double travelBearing = effectiveTravelBearing();
+        boolean bearingOk = !Double.isNaN(travelBearing) && accuracyOk &&
+                (speedKmh >= 5.0f || (lastMovementBearingMs > 0 && now - lastMovementBearingMs <= 4000));
 
         if (!bearingOk) {
             fastDeviationSinceMs = 0;
             missedTurnSinceMs = 0;
             hardDeviationSinceMs = 0;
+            nearWrongRoadSinceMs = 0;
+            nearWrongRoadSamples = 0;
             return false;
         }
 
@@ -516,12 +548,33 @@ public class NavigationService extends Service {
             fastDeviationSinceMs = 0;
             missedTurnSinceMs = 0;
             hardDeviationSinceMs = 0;
+            nearWrongRoadSinceMs = 0;
+            nearWrongRoadSamples = 0;
             return false;
         }
 
-        double headingDiff = Math.abs(angleDiff(currentLocation.getBearing(), expectedBearing));
+        double headingDiff = Math.abs(angleDiff(travelBearing, expectedBearing));
         boolean growing = !Double.isNaN(previousOff) &&
                 offRouteMeters >= previousOff + FAST_DISTANCE_GROWTH_METERS;
+
+        // 0) Early wrong-road detection. Require a meaningful heading mismatch plus at
+        // least a small separation from the tracked route and two fresh moving samples.
+        // This is what makes a missed turn react quickly without lowering map snap tolerance.
+        boolean nearWrongRoad = offRouteMeters >= NEAR_WRONG_ROAD_MIN_METERS &&
+                headingDiff >= NEAR_WRONG_ROAD_HEADING_DIFF_DEG &&
+                (!Double.isNaN(previousOff) && offRouteMeters >= previousOff - 0.5);
+        if (nearWrongRoad) {
+            if (nearWrongRoadSinceMs == 0) nearWrongRoadSinceMs = now;
+            nearWrongRoadSamples++;
+            if (nearWrongRoadSamples >= NEAR_WRONG_ROAD_MIN_SAMPLES &&
+                    now - nearWrongRoadSinceMs >= NEAR_WRONG_ROAD_CONFIRM_MS) {
+                offRouteConfirmed = true;
+                return startAutomaticReroute(now);
+            }
+        } else {
+            nearWrongRoadSinceMs = 0;
+            nearWrongRoadSamples = 0;
+        }
 
         // 1) Very clear deviation: >=50 m and direction incompatible with the route.
         // Confirm for one second rather than firing on one isolated fix.
@@ -585,7 +638,7 @@ public class NavigationService extends Service {
             if (armedManeuverStartIndex == turnIndex) {
                 double outgoingBearing = routeHeadingAfterIndex(copy, turnIndex, 28.0);
                 double outgoingDiff = Double.isNaN(outgoingBearing) ? 0.0 :
-                        Math.abs(angleDiff(currentLocation.getBearing(), outgoingBearing));
+                        Math.abs(angleDiff(travelBearing, outgoingBearing));
                 boolean movingAwayFromTurn = rawDistanceToTurn >=
                         armedManeuverMinDistance + MISSED_TURN_MOVING_AWAY_METERS;
                 boolean missedTurnCondition = movingAwayFromTurn
@@ -653,6 +706,8 @@ public class NavigationService extends Service {
         fastDeviationSinceMs = 0;
         missedTurnSinceMs = 0;
         hardDeviationSinceMs = 0;
+        nearWrongRoadSinceMs = 0;
+        nearWrongRoadSamples = 0;
         armedManeuverStartIndex = -1;
         armedManeuverMinDistance = Double.POSITIVE_INFINITY;
         missedTurnMismatchSamples = 0;
@@ -736,6 +791,7 @@ public class NavigationService extends Service {
                     offRouteConfirmed = false;
                     offRouteMeters = 0;
                     resetFastDeviationTracking();
+                    lastTrackingRouteIndex = 0;
                     updateNotification("Rotta aggiornata", navigationLabel() + " - " +
                             ("shortest".equals(routeMode) ? "breve" : "veloce") +
                             (allowFastRoads ? " + strade veloci" : " no autostrade") +
@@ -924,7 +980,7 @@ public class NavigationService extends Service {
             return;
         }
 
-        RouteMatch match = matchRoute(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
+        RouteMatch match = matchRouteTracked(copy, currentLocation.getLatitude(), currentLocation.getLongitude());
         int nearest = match.index;
         offRouteMeters = match.offMeters;
 
@@ -956,8 +1012,9 @@ public class NavigationService extends Service {
         // Build the display polyline only after the next maneuver is known.
         // This allows a closer scale around roundabouts while still sending every
         // ORS geometry point available inside the visible look-ahead window.
-        String line = buildScreenLine(copy, match, currentLocation, turn, dist);
-        String roads = buildScreenRoads(copy, match, currentLocation, turn, dist);
+        double displayBearing = effectiveTravelBearing();
+        String line = buildScreenLine(copy, match, currentLocation, turn, dist, displayBearing);
+        String roads = buildScreenRoads(copy, match, currentLocation, turn, dist, displayBearing);
 
         try {
             JSONObject o = new JSONObject();
@@ -1166,7 +1223,7 @@ public class NavigationService extends Service {
     }
 
     private String buildScreenRoads(ArrayList<LatLon> routePts, RouteMatch match, Location loc,
-                                    String turn, int distToTurn) {
+                                    String turn, int distToTurn, double displayBearing) {
         ArrayList<ArrayList<LatLon>> ways = new ArrayList<>();
         synchronized (contextRoads) {
             for (ArrayList<LatLon> way : contextRoads) ways.add(new ArrayList<>(way));
@@ -1184,9 +1241,11 @@ public class NavigationService extends Service {
         LatLon headingPoint = routePts.get(headingEnd);
         double head = bearing(lat0, lon0, headingPoint.lat, headingPoint.lon);
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
-        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
-            // Keep grey context roads in exactly the same heading-up frame as the
-            // white route. Otherwise the two layers rotate differently after a wrong turn.
+        if (!Double.isNaN(displayBearing) && speedKmh >= 5.0f) {
+            // Keep grey context roads in the same real heading-up frame, also on phones
+            // where Location.getBearing() is intermittent.
+            head = displayBearing;
+        } else if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
             head = loc.getBearing();
         }
 
@@ -1517,6 +1576,123 @@ public class NavigationService extends Service {
         return sb.toString();
     }
 
+
+    // V0.32: derive heading from actual movement when Android's GPS fix does not provide
+    // a usable bearing. This is intentionally independent from the map snap.
+    private void updateMovementBearing(Location loc) {
+        if (loc == null) return;
+        long now = System.currentTimeMillis();
+        if (lastMovementFix != null) {
+            long dt = loc.getTime() > 0 && lastMovementFix.getTime() > 0
+                    ? loc.getTime() - lastMovementFix.getTime() : 0;
+            double d = distanceMeters(lastMovementFix.getLatitude(), lastMovementFix.getLongitude(),
+                    loc.getLatitude(), loc.getLongitude());
+            if (d >= 3.0 && (dt <= 0 || dt <= 6000)) {
+                lastMovementBearing = bearing(lastMovementFix.getLatitude(), lastMovementFix.getLongitude(),
+                        loc.getLatitude(), loc.getLongitude());
+                lastMovementBearingMs = now;
+            }
+        }
+        try { lastMovementFix = new Location(loc); } catch (Exception ignored) { lastMovementFix = loc; }
+    }
+
+    private double effectiveTravelBearing() {
+        if (currentLocation == null) return Double.NaN;
+        float speedKmh = currentLocation.hasSpeed() ? Math.max(0, currentLocation.getSpeed() * 3.6f) : 0;
+        if (currentLocation.hasBearing() && speedKmh >= 5.0f) {
+            return currentLocation.getBearing();
+        }
+        long now = System.currentTimeMillis();
+        if (!Double.isNaN(lastMovementBearing) && lastMovementBearingMs > 0 &&
+                now - lastMovementBearingMs <= 4000) {
+            return lastMovementBearing;
+        }
+        return currentLocation.hasBearing() ? currentLocation.getBearing() : Double.NaN;
+    }
+
+    // Match only the corridor around the already travelled part of the route. A full-route
+    // nearest-point search is ambiguous around loops, parallel roads and return segments.
+    private RouteMatch matchRouteTracked(ArrayList<LatLon> pts, double lat, double lon) {
+        if (pts == null || pts.size() < 2) return matchRoute(pts, lat, lon);
+
+        int anchor = Math.max(0, Math.min(lastTrackingRouteIndex, pts.size() - 2));
+        int from = walkRouteIndexBackward(pts, anchor, 90.0);
+        int to = walkRouteIndexForward(pts, anchor, 650.0);
+        RouteMatch m = matchRouteRange(pts, lat, lon, from, to);
+
+        // Routes are calculated from the current GPS position, so forward progress should
+        // normally be monotonic. Allow a tiny backward correction for GPS jitter only.
+        if (m.index > lastTrackingRouteIndex) {
+            lastTrackingRouteIndex = m.index;
+        } else if (lastTrackingRouteIndex - m.index <= 3) {
+            lastTrackingRouteIndex = Math.max(0, m.index);
+        }
+        return m;
+    }
+
+    private static int walkRouteIndexBackward(ArrayList<LatLon> pts, int start, double meters) {
+        double acc = 0;
+        int i = Math.max(0, Math.min(start, pts.size() - 2));
+        while (i > 0 && acc < meters) {
+            acc += distanceMeters(pts.get(i).lat, pts.get(i).lon, pts.get(i - 1).lat, pts.get(i - 1).lon);
+            i--;
+        }
+        return i;
+    }
+
+    private static int walkRouteIndexForward(ArrayList<LatLon> pts, int start, double meters) {
+        double acc = 0;
+        int i = Math.max(0, Math.min(start, pts.size() - 2));
+        while (i < pts.size() - 2 && acc < meters) {
+            acc += distanceMeters(pts.get(i).lat, pts.get(i).lon, pts.get(i + 1).lat, pts.get(i + 1).lon);
+            i++;
+        }
+        return Math.max(i, start + 1);
+    }
+
+    private static RouteMatch matchRouteRange(ArrayList<LatLon> pts, double lat, double lon, int from, int to) {
+        if (pts == null || pts.isEmpty()) return new RouteMatch(0, lat, lon, 9999);
+        if (pts.size() == 1) return matchRoute(pts, lat, lon);
+
+        int first = Math.max(0, Math.min(from, pts.size() - 2));
+        int last = Math.max(first, Math.min(to, pts.size() - 2));
+        double best = 1e18;
+        int bestIndex = first;
+        double bestLat = pts.get(first).lat;
+        double bestLon = pts.get(first).lon;
+        double latRad = Math.toRadians(lat);
+        double metersPerDegLat = 111320.0;
+        double metersPerDegLon = Math.cos(latRad) * 111320.0;
+
+        for (int i = first; i <= last; i++) {
+            LatLon a = pts.get(i);
+            LatLon b = pts.get(i + 1);
+            double ax = (a.lon - lon) * metersPerDegLon;
+            double ay = (a.lat - lat) * metersPerDegLat;
+            double bx = (b.lon - lon) * metersPerDegLon;
+            double by = (b.lat - lat) * metersPerDegLat;
+            double vx = bx - ax;
+            double vy = by - ay;
+            double len2 = vx * vx + vy * vy;
+            double t = 0;
+            if (len2 > 0.001) {
+                t = -(ax * vx + ay * vy) / len2;
+                if (t < 0) t = 0;
+                if (t > 1) t = 1;
+            }
+            double px = ax + vx * t;
+            double py = ay + vy * t;
+            double d = Math.sqrt(px * px + py * py);
+            if (d < best) {
+                best = d;
+                bestIndex = i;
+                bestLat = a.lat + (b.lat - a.lat) * t;
+                bestLon = a.lon + (b.lon - a.lon) * t;
+            }
+        }
+        return new RouteMatch(bestIndex, bestLat, bestLon, best);
+    }
+
     private static RouteMatch matchRoute(ArrayList<LatLon> pts, double lat, double lon) {
         if (pts == null || pts.isEmpty()) {
             return new RouteMatch(0, lat, lon, 9999);
@@ -1692,7 +1868,7 @@ public class NavigationService extends Service {
         return (int) Math.min(99999, acc);
     }
 
-    private static String buildScreenLine(ArrayList<LatLon> pts, RouteMatch match, Location loc, String turn, int distToTurn) {
+    private static String buildScreenLine(ArrayList<LatLon> pts, RouteMatch match, Location loc, String turn, int distToTurn, double displayBearing) {
         int idx = Math.max(0, Math.min(match.index, pts.size() - 1));
 
         if (pts.size() < 2 || idx >= pts.size() - 1) {
@@ -1723,11 +1899,11 @@ public class NavigationService extends Service {
         double head = bearing(lat0, lon0, headingPoint.lat, headingPoint.lon);
 
         float speedKmh = Math.max(0, loc.getSpeed() * 3.6f);
-        if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
-            // Heading-up must follow the REAL direction of travel, even when that
-            // direction disagrees with the planned route (exactly what happens after
-            // a missed turn). The old 55-degree gate left the Carlyle visually rotated
-            // toward the planned road when the rider was actually going elsewhere.
+        if (!Double.isNaN(displayBearing) && speedKmh >= 5.0f) {
+            // Heading-up follows actual movement. displayBearing can come either from
+            // Android GPS bearing or from consecutive GPS positions (V0.32 fallback).
+            head = displayBearing;
+        } else if (loc.hasBearing() && speedKmh >= GPS_BEARING_MIN_SPEED_KMH) {
             head = loc.getBearing();
         }
 
