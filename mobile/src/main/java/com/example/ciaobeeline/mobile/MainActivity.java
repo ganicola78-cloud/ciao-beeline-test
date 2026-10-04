@@ -70,6 +70,8 @@ public class MainActivity extends Activity {
     private static final String PREF_NAV_TARGET_LON = "nav_target_lon_v1";
     private static final String PREF_NAV_TARGET_LABEL = "nav_target_label_v1";
     private static final String PREF_NAV_ROUTE_POINTS = "nav_route_points_v1";
+    private static final String PREF_LIVE_ROUTE_GEOMETRY = "live_route_geometry_v1";
+    private static final String PREF_LIVE_ROUTE_REV = "live_route_rev_v1";
 
     // Tile source OSM con User-Agent esplicito: evita il profilo MAPNIK di osmdroid
     // che forza il User-Agent normalizzato package/versione.
@@ -103,6 +105,16 @@ public class MainActivity extends Activity {
     private MapEventsOverlay mapEventsOverlay;
     private Marker currentLocationMarker;
     private final ArrayList<GeoPoint> displayedRoutePoints = new ArrayList<>();
+    private Polyline displayedRoutePolyline;
+    private long lastLiveRouteRevision = Long.MIN_VALUE;
+    private final android.os.Handler liveRouteUiHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable liveRouteUiRefresh = new Runnable() {
+        @Override public void run() {
+            refreshLiveRouteFromPrefs();
+            liveRouteUiHandler.postDelayed(this, 500);
+        }
+    };
     private static final double PHONE_ROUTE_SNAP_METERS = 20.0;
     private LocationManager mapLocationManager;
     private Location lastMapLocation;
@@ -1609,6 +1621,7 @@ public class MainActivity extends Activity {
 
     private void redrawSelectedRoutePoints() {
         displayedRoutePoints.clear();
+        displayedRoutePolyline = null;
         routeMap.getOverlays().clear();
 
         // Prima i marker, poi l'overlay degli eventi.
@@ -1846,6 +1859,7 @@ public class MainActivity extends Activity {
         line.setPoints(previewRoute.points);
         line.setWidth(8f);
         line.setColor(0xff1976d2);
+        displayedRoutePolyline = line;
         routeMap.getOverlays().add(line);
 
         // Ridisegna partenza, waypoint e arrivo sopra la linea.
@@ -1885,6 +1899,7 @@ public class MainActivity extends Activity {
         line.setPoints(previewRoute.points);
         line.setWidth(8f);
         line.setColor(0xff1976d2);
+        displayedRoutePolyline = line;
         routeMap.getOverlays().add(line);
 
         Marker startMarker = new Marker(routeMap);
@@ -1935,6 +1950,78 @@ public class MainActivity extends Activity {
             routeMap.getController().setCenter(center);
             routeMap.getController().setZoom(14.0);
         }
+    }
+
+
+    // V0.33: NavigationService publishes the complete ORS route geometry in the same
+    // SharedPreferences file. This lets the phone map show the real live route instead
+    // of keeping the old preview polyline after a reroute.
+    private void refreshLiveRouteFromPrefs() {
+        if (routeMap == null) return;
+
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        long revision = p.getLong(PREF_LIVE_ROUTE_REV, 0L);
+        if (revision <= 0L) {
+            if (lastLiveRouteRevision == Long.MIN_VALUE) lastLiveRouteRevision = 0L;
+            return;
+        }
+        if (revision == lastLiveRouteRevision) return;
+        lastLiveRouteRevision = revision;
+
+        String encoded = p.getString(PREF_LIVE_ROUTE_GEOMETRY, "");
+        ArrayList<GeoPoint> livePoints = decodeLiveRouteGeometry(encoded);
+
+        if (livePoints.size() < 2) {
+            displayedRoutePoints.clear();
+            if (displayedRoutePolyline != null) {
+                routeMap.getOverlays().remove(displayedRoutePolyline);
+                displayedRoutePolyline = null;
+            }
+            addCurrentLocationMarkerOverlay();
+            routeMap.invalidate();
+            return;
+        }
+
+        displayedRoutePoints.clear();
+        displayedRoutePoints.addAll(livePoints);
+
+        if (displayedRoutePolyline != null) {
+            routeMap.getOverlays().remove(displayedRoutePolyline);
+        }
+
+        Polyline line = new Polyline();
+        line.setPoints(livePoints);
+        line.setWidth(8f);
+        line.setColor(0xff1976d2);
+        displayedRoutePolyline = line;
+
+        // Put the route below markers and the MapEventsOverlay.
+        routeMap.getOverlays().add(0, line);
+        addCurrentLocationMarkerOverlay();
+
+        // Re-snap/reposition the phone arrow immediately against the new route.
+        if (lastMapLocation != null) {
+            updateCurrentLocationMarker(lastMapLocation);
+        } else {
+            routeMap.invalidate();
+        }
+    }
+
+    private ArrayList<GeoPoint> decodeLiveRouteGeometry(String encoded) {
+        ArrayList<GeoPoint> out = new ArrayList<>();
+        if (encoded == null || encoded.trim().isEmpty()) return out;
+
+        String[] pairs = encoded.split(";");
+        for (String pair : pairs) {
+            int comma = pair.indexOf(',');
+            if (comma <= 0 || comma >= pair.length() - 1) continue;
+            try {
+                double lat = Double.parseDouble(pair.substring(0, comma));
+                double lon = Double.parseDouble(pair.substring(comma + 1));
+                out.add(new GeoPoint(lat, lon));
+            } catch (Exception ignored) {}
+        }
+        return out;
     }
 
     private String formatPreviewDistance(double meters) {
@@ -2033,6 +2120,7 @@ public class MainActivity extends Activity {
 
         selectedRoutePoints.clear();
         displayedRoutePoints.clear();
+        displayedRoutePolyline = null;
         lastSelectedPointIndex = -1;
         if (routeMap != null) {
             routeMap.getOverlays().clear();
@@ -2059,10 +2147,17 @@ public class MainActivity extends Activity {
         super.onResume();
         if (routeMap != null) routeMap.onResume();
         startMapLocationUpdates();
+
+        // V0.33: while the phone map is visible, pick up the exact geometry produced
+        // by NavigationService after every initial calculation or reroute.
+        liveRouteUiHandler.removeCallbacks(liveRouteUiRefresh);
+        refreshLiveRouteFromPrefs();
+        liveRouteUiHandler.postDelayed(liveRouteUiRefresh, 500);
     }
 
     @Override
     protected void onPause() {
+        liveRouteUiHandler.removeCallbacks(liveRouteUiRefresh);
         stopMapLocationUpdates();
         if (routeMap != null) routeMap.onPause();
         super.onPause();

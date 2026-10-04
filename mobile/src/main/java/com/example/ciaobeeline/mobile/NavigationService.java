@@ -49,6 +49,8 @@ public class NavigationService extends Service {
     private static final String PREF_NAV_TARGET_LON = "nav_target_lon_v1";
     private static final String PREF_NAV_TARGET_LABEL = "nav_target_label_v1";
     private static final String PREF_NAV_ROUTE_POINTS = "nav_route_points_v1";
+    private static final String PREF_LIVE_ROUTE_GEOMETRY = "live_route_geometry_v1";
+    private static final String PREF_LIVE_ROUTE_REV = "live_route_rev_v1";
     public static final String ACTION_START = "com.example.ciaobeeline.START_NAV";
     public static final String ACTION_STOP = "com.example.ciaobeeline.STOP_NAV";
     public static final String ACTION_REROUTE = "com.example.ciaobeeline.REROUTE_NAV";
@@ -391,6 +393,7 @@ public class NavigationService extends Service {
         synchronized (route) { route.clear(); }
         synchronized (maneuvers) { maneuvers.clear(); }
         synchronized (contextRoads) { contextRoads.clear(); }
+        publishLiveRoute(new ArrayList<>());
         offRouteMeters = 0;
         offRouteSinceMs = 0;
         offRouteConfirmed = false;
@@ -778,6 +781,11 @@ public class NavigationService extends Service {
                     route.clear();
                     route.addAll(result.points);
                 }
+
+                // V0.33: publish the exact route returned by ORS so the phone map can
+                // replace its old preview geometry immediately after a reroute.
+                publishLiveRoute(result.points);
+
                 synchronized (maneuvers) {
                     maneuvers.clear();
                     maneuvers.addAll(result.maneuvers);
@@ -815,6 +823,30 @@ public class NavigationService extends Service {
                 });
             }
         }).start();
+    }
+
+
+    private void publishLiveRoute(ArrayList<LatLon> points) {
+        StringBuilder sb = new StringBuilder();
+        if (points != null) {
+            for (int i = 0; i < points.size(); i++) {
+                LatLon p = points.get(i);
+                if (i > 0) sb.append(';');
+                // Keep the full ORS geometry; Double.toString preserves enough
+                // precision while remaining compact for SharedPreferences.
+                sb.append(Double.toString(p.lat))
+                        .append(',')
+                        .append(Double.toString(p.lon));
+            }
+        }
+
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        long previousRevision = prefs.getLong(PREF_LIVE_ROUTE_REV, 0L);
+        long revision = Math.max(System.currentTimeMillis(), previousRevision + 1L);
+        prefs.edit()
+                .putString(PREF_LIVE_ROUTE_GEOMETRY, sb.toString())
+                .putLong(PREF_LIVE_ROUTE_REV, revision)
+                .apply();
     }
 
     private String navigationLabel() {
