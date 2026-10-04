@@ -41,7 +41,6 @@ public class NavView extends View {
     private final Paint routeShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint routePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint roadPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint roadShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mutedTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint thinLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -106,19 +105,13 @@ public class NavView extends View {
         routePaint.setStrokeCap(Paint.Cap.ROUND);
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
-        // V0.35: all useful side-road references are short white stubs.  Keep them
-        // clearly visible but much thinner than the 8 px active route.
+        // V0.36: side-road references are intentionally brighter/thicker so they remain
+        // visible on the Carlyle OLED, while still being clearly secondary to the 8 px route.
         roadPaint.setStyle(Paint.Style.STROKE);
         roadPaint.setColor(Color.WHITE);
-        roadPaint.setStrokeWidth(3.4f);
+        roadPaint.setStrokeWidth(3.6f);
         roadPaint.setStrokeCap(Paint.Cap.ROUND);
         roadPaint.setStrokeJoin(Paint.Join.ROUND);
-
-        roadShadowPaint.setStyle(Paint.Style.STROKE);
-        roadShadowPaint.setColor(Color.rgb(22, 22, 22));
-        roadShadowPaint.setStrokeWidth(6.0f);
-        roadShadowPaint.setStrokeCap(Paint.Cap.ROUND);
-        roadShadowPaint.setStrokeJoin(Paint.Join.ROUND);
 
         textPaint.setColor(Color.WHITE);
         textPaint.setTextAlign(Paint.Align.CENTER);
@@ -495,7 +488,6 @@ public class NavView extends View {
             }
 
             Path p = exactPath(pts);
-            c.drawPath(p, roadShadowPaint);
             c.drawPath(p, roadPaint);
         }
     }
