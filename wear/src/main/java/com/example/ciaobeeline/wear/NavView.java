@@ -41,6 +41,7 @@ public class NavView extends View {
     private final Paint routeShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint routePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint roadPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint roadShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mutedTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint thinLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -109,9 +110,15 @@ public class NavView extends View {
         // clearly visible but much thinner than the 8 px active route.
         roadPaint.setStyle(Paint.Style.STROKE);
         roadPaint.setColor(Color.WHITE);
-        roadPaint.setStrokeWidth(2.6f);
+        roadPaint.setStrokeWidth(3.4f);
         roadPaint.setStrokeCap(Paint.Cap.ROUND);
         roadPaint.setStrokeJoin(Paint.Join.ROUND);
+
+        roadShadowPaint.setStyle(Paint.Style.STROKE);
+        roadShadowPaint.setColor(Color.rgb(22, 22, 22));
+        roadShadowPaint.setStrokeWidth(6.0f);
+        roadShadowPaint.setStrokeCap(Paint.Cap.ROUND);
+        roadShadowPaint.setStrokeJoin(Paint.Join.ROUND);
 
         textPaint.setColor(Color.WHITE);
         textPaint.setTextAlign(Paint.Align.CENTER);
@@ -488,6 +495,7 @@ public class NavView extends View {
             }
 
             Path p = exactPath(pts);
+            c.drawPath(p, roadShadowPaint);
             c.drawPath(p, roadPaint);
         }
     }
