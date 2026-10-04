@@ -105,8 +105,9 @@ public class NavView extends View {
         routePaint.setStrokeCap(Paint.Cap.ROUND);
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
-        // V0.36: side-road references are intentionally brighter/thicker so they remain
-        // visible on the Carlyle OLED, while still being clearly secondary to the 8 px route.
+        // V0.36: side-road references are intentionally easy to see on the Carlyle.
+        // They remain much thinner than the 8 px active route, but are thick enough
+        // to be readable outdoors and on the round low-resolution display.
         roadPaint.setStyle(Paint.Style.STROKE);
         roadPaint.setColor(Color.WHITE);
         roadPaint.setStrokeWidth(3.6f);
