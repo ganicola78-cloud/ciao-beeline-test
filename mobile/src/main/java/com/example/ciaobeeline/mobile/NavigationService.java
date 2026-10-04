@@ -107,16 +107,17 @@ public class NavigationService extends Service {
     private static final long CONTEXT_ROADS_REFRESH_MS = 35000;
     private static final long CONTEXT_ROADS_MIN_REFRESH_MS = 15000;
     private static final double CONTEXT_ROADS_REFRESH_DISTANCE_M = 160.0;
-    private static final double CONTEXT_ROADS_QUERY_RADIUS_M = 380.0;
+    private static final double CONTEXT_ROADS_QUERY_RADIUS_M = 420.0;
 
-    // V0.35: show every useful side-road near the visible route as a short stub.
-    // V0.34 was too selective (exact junction + angle filters), so genuine side roads
-    // could disappear.  The active route stays thick; these references stay short/thin.
-    private static final double CONTEXT_BRANCH_JOIN_METERS = 24.0;
-    private static final double CONTEXT_BRANCH_STUB_METERS = 28.0;
-    private static final double CONTEXT_BRANCH_MIN_AXIS_ANGLE_DEG = 3.0;
-    private static final double CONTEXT_BRANCH_MAX_AHEAD_METERS = 205.0;
-    private static final double CONTEXT_BRANCH_ALLOW_BEHIND_METERS = 12.0;
+    // V0.36: make side-road references deliberately permissive and visible.
+    // We sample every nearby OSM road segment against the visible route corridor, rather
+    // than requiring an OSM vertex to land almost exactly on the ORS geometry. The active
+    // route is still drawn last/thick, so duplicate context underneath it is harmless.
+    private static final double CONTEXT_BRANCH_JOIN_METERS = 42.0;
+    private static final double CONTEXT_BRANCH_STUB_METERS = 20.0;
+    private static final double CONTEXT_BRANCH_MIN_AXIS_ANGLE_DEG = 0.0;
+    private static final double CONTEXT_BRANCH_MAX_AHEAD_METERS = 215.0;
+    private static final double CONTEXT_BRANCH_ALLOW_BEHIND_METERS = 20.0;
     private static final int CONTEXT_BRANCH_MAX_VISIBLE = 40;
     // V0.21: keep the ORS geometry dense enough to preserve roundabouts and tight bends.
     // The base zoom is intentionally a little closer than V0.20; near a roundabout
@@ -1213,39 +1214,43 @@ public class NavigationService extends Service {
     }
 
     private ArrayList<ArrayList<LatLon>> requestNearbyRoadGeometry(double lat, double lon) throws Exception {
-        // V0.35: Overpass can occasionally rate-limit a single public endpoint.  Try one
-        // fallback mirror only on an actual request error; a successful empty response is
-        // treated as a valid rural-area result.
+        // V0.36: an empty response from one public Overpass mirror is not considered
+        // definitive. Try the next mirror so temporary backend quirks do not leave the
+        // Carlyle without any side-road references.
         String[] endpoints = new String[]{
                 "https://overpass-api.de/api/interpreter",
-                "https://overpass.kumi.systems/api/interpreter"
+                "https://overpass.kumi.systems/api/interpreter",
+                "https://overpass.nchc.org.tw/api/interpreter"
         };
         Exception last = null;
+        ArrayList<ArrayList<LatLon>> empty = new ArrayList<>();
         for (String endpoint : endpoints) {
             try {
-                return requestNearbyRoadGeometryFromEndpoint(endpoint, lat, lon);
+                ArrayList<ArrayList<LatLon>> result = requestNearbyRoadGeometryFromEndpoint(endpoint, lat, lon);
+                if (!result.isEmpty()) return result;
+                empty = result;
             } catch (Exception e) {
                 last = e;
             }
         }
-        if (last != null) throw last;
-        return new ArrayList<>();
+        if (last != null && empty.isEmpty()) throw last;
+        return empty;
     }
 
     private ArrayList<ArrayList<LatLon>> requestNearbyRoadGeometryFromEndpoint(
             String endpoint, double lat, double lon) throws Exception {
         URL url = new URL(endpoint);
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
-        c.setConnectTimeout(5000);
-        c.setReadTimeout(6500);
+        c.setConnectTimeout(6000);
+        c.setReadTimeout(9000);
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8");
         c.setRequestProperty("Accept", "application/json");
-        c.setRequestProperty("User-Agent", "CiaoBeeline/0.36 (Wear OS navigation)");
+        c.setRequestProperty("User-Agent", "CiaoBeeline/0.36 Android");
 
         String highwayRegex = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|living_street|service|unclassified|road|track";
-        String query = "[out:json][timeout:5];" +
+        String query = "[out:json][timeout:8];" +
                 "way(around:" + (int) CONTEXT_ROADS_QUERY_RADIUS_M + "," + lat + "," + lon + ")" +
                 "[\"highway\"~\"^(" + highwayRegex + ")$\"];" +
                 "out geom;";
@@ -1265,24 +1270,40 @@ public class NavigationService extends Service {
         ArrayList<ArrayList<LatLon>> out = new ArrayList<>();
         if (elements == null) return out;
 
-        // Keep substantially more ways than V0.34. Overpass order is not spatially
-        // meaningful, so a low cap could omit the actual side roads beside the rider.
-        for (int i = 0; i < elements.length() && out.size() < 72; i++) {
+        // V0.36: do not discard useful roads just because Overpass returns them late in
+        // its result set. Keep a generous cap and let the on-screen corridor filter do
+        // the real reduction afterwards.
+        for (int i = 0; i < elements.length() && out.size() < 240; i++) {
             JSONObject e = elements.optJSONObject(i);
             if (e == null) continue;
             JSONArray geometry = e.optJSONArray("geometry");
             if (geometry == null || geometry.length() < 2) continue;
 
             ArrayList<LatLon> way = new ArrayList<>();
-            int stride = Math.max(1, geometry.length() / 120);
+            int stride = Math.max(1, geometry.length() / 180);
             for (int g = 0; g < geometry.length(); g += stride) {
-                JSONObject p = geometry.optJSONObject(g);
-                if (p == null) continue;
-                double plat = p.optDouble("lat", Double.NaN);
-                double plon = p.optDouble("lon", Double.NaN);
+                JSONObject point = geometry.optJSONObject(g);
+                if (point == null) continue;
+                double plat = point.optDouble("lat", Double.NaN);
+                double plon = point.optDouble("lon", Double.NaN);
                 if (Double.isNaN(plat) || Double.isNaN(plon)) continue;
-                if (distanceMeters(lat, lon, plat, plon) <= CONTEXT_ROADS_QUERY_RADIUS_M + 45.0) {
+                if (distanceMeters(lat, lon, plat, plon) <= CONTEXT_ROADS_QUERY_RADIUS_M + 60.0) {
                     way.add(new LatLon(plat, plon));
+                }
+            }
+            // Preserve the last geometry vertex when stride > 1; otherwise a short road
+            // can lose the exact branch end that makes it recognizable on the watch.
+            if (geometry.length() > 1) {
+                JSONObject lastPoint = geometry.optJSONObject(geometry.length() - 1);
+                if (lastPoint != null) {
+                    double plat = lastPoint.optDouble("lat", Double.NaN);
+                    double plon = lastPoint.optDouble("lon", Double.NaN);
+                    if (!Double.isNaN(plat) && !Double.isNaN(plon) &&
+                            distanceMeters(lat, lon, plat, plon) <= CONTEXT_ROADS_QUERY_RADIUS_M + 60.0) {
+                        if (way.isEmpty() || distanceMeters(way.get(way.size() - 1).lat, way.get(way.size() - 1).lon, plat, plon) > 0.2) {
+                            way.add(new LatLon(plat, plon));
+                        }
+                    }
                 }
             }
             if (way.size() >= 2) out.add(way);
@@ -1292,10 +1313,6 @@ public class NavigationService extends Service {
 
     private String buildScreenRoads(ArrayList<LatLon> routePts, RouteMatch match, Location loc,
                                     String turn, int distToTurn, double displayBearing) {
-        // V0.36: draw the nearby OSM road NETWORK as many short stubs instead of trying
-        // to prove that each way intersects the ORS polyline at exactly one junction.
-        // Different OSM/ORS samplings made that old test too fragile, which is why the
-        // Carlyle could receive an empty "roads" field even in a normal town street.
         ArrayList<ArrayList<LatLon>> ways = new ArrayList<>();
         synchronized (contextRoads) {
             for (ArrayList<LatLon> way : contextRoads) ways.add(new ArrayList<>(way));
@@ -1325,8 +1342,7 @@ public class NavigationService extends Service {
         double pixelsPerMeter = ("ROUND".equals(turn) && distToTurn >= 0 && distToTurn <= 140)
                 ? ROUNDABOUT_PIXELS_PER_METER : SCREEN_PIXELS_PER_METER;
 
-        // Only the part of the active route that can be seen on the Carlyle is needed
-        // to suppress duplicate segments belonging to the route itself.
+        // Build the route corridor actually visible on the Carlyle.
         ArrayList<LatLon> routeWindow = new ArrayList<>();
         routeWindow.add(new LatLon(lat0, lon0));
         double routeWalked = 0.0;
@@ -1338,82 +1354,74 @@ public class NavigationService extends Service {
             prevRoute = rp;
             if (routeWalked >= CONTEXT_BRANCH_MAX_AHEAD_METERS + 55.0 || routeWindow.size() >= 220) break;
         }
+        if (routeWindow.size() < 2) return "";
 
-        ArrayList<ScreenRoadStub> candidates = new ArrayList<>();
+        ArrayList<BranchCandidate> candidates = new ArrayList<>();
 
         for (ArrayList<LatLon> way : ways) {
             if (way == null || way.size() < 2) continue;
 
-            for (int wi = 0; wi < way.size() - 1; wi++) {
-                LatLon a = way.get(wi);
-                LatLon b = way.get(wi + 1);
-                double segLen = distanceMeters(a.lat, a.lon, b.lat, b.lon);
-                if (segLen < 2.0) continue;
+            // V0.36: sample along every OSM segment. V0.35 looked mainly at OSM
+            // vertices, which can miss a junction when ORS and OSM use different
+            // geometry points or when a long OSM segment crosses the route between nodes.
+            RoadJoin join = findClosestRoadJoin(way, routeWindow);
+            if (join == null || join.offMeters > CONTEXT_BRANCH_JOIN_METERS) continue;
 
-                double midLat = (a.lat + b.lat) * 0.5;
-                double midLon = (a.lon + b.lon) * 0.5;
-                double east = (midLon - lon0) * metersPerDegLon;
-                double north = (midLat - lat0) * metersPerDegLat;
-                double right = east * cosH - north * sinH;
-                double forward = east * sinH + north * cosH;
+            LatLon junction = join.point;
+            double east = (junction.lon - lon0) * metersPerDegLon;
+            double north = (junction.lat - lat0) * metersPerDegLat;
+            double right = east * cosH - north * sinH;
+            double forward = east * sinH + north * cosH;
 
-                // Keep every real road segment in the useful navigation field.  A few
-                // metres behind are retained so a side road remains visible while the
-                // rider is actually crossing the junction.
-                if (forward < -18.0 || forward > CONTEXT_BRANCH_MAX_AHEAD_METERS) continue;
-                if (Math.abs(right) > 112.0) continue;
+            if (forward < -CONTEXT_BRANCH_ALLOW_BEHIND_METERS ||
+                    forward > CONTEXT_BRANCH_MAX_AHEAD_METERS) continue;
+            if (Math.abs(right) > 135.0) continue;
 
-                double sx = 120.0 + right * pixelsPerMeter;
-                double sy = 164.0 - forward * pixelsPerMeter;
-                if (sx < 4.0 || sx > 236.0 || sy < 4.0 || sy > 204.0) continue;
+            double wayAxis = bearing(way.get(join.segmentIndex).lat, way.get(join.segmentIndex).lon,
+                    way.get(join.segmentIndex + 1).lat, way.get(join.segmentIndex + 1).lon);
+            double routeAxis = localAxisBearing(routeWindow, join.routeIndex);
+            double axisDiff = axisAngleDiff(wayAxis, routeAxis);
 
-                double segBearing = bearing(a.lat, a.lon, b.lat, b.lon);
+            // Do NOT suppress roads parallel to the route in V0.36. The thick active
+            // route is drawn after these references and naturally covers duplicates.
+            // This is intentional: the user asked to see all possible side references.
+            double sx = 120.0 + right * pixelsPerMeter;
+            double sy = 164.0 - forward * pixelsPerMeter;
+            if (sx < -12.0 || sx > 252.0 || sy < -12.0 || sy > 198.0) continue;
 
-                // Suppress only segments that are unmistakably the active route itself.
-                // Crossing roads, forks and slip roads stay visible even when their
-                // centre lies very close to the route line.
-                RouteMatch rm = matchRoute(routeWindow, midLat, midLon);
-                if (rm.offMeters <= 7.5) {
-                    double routeAxis = localAxisBearing(routeWindow, rm.index);
-                    if (axisAngleDiff(segBearing, routeAxis) < 10.0) continue;
-                }
-
-                ArrayList<LatLon> stub = shortSegmentAroundMidpoint(a, b,
-                        CONTEXT_BRANCH_STUB_METERS);
-                if (stub.size() < 2) continue;
-
-                // Prioritise the nearest intersections, but do not require a junction
-                // match. This is what makes the reference lines reliably appear.
-                double priority = Math.max(0.0, forward) + Math.abs(right) * 0.18;
-                candidates.add(new ScreenRoadStub(stub, sx, sy, segBearing, priority));
-                if (candidates.size() >= 220) break;
-            }
-            if (candidates.size() >= 220) break;
+            candidates.add(new BranchCandidate(way, join.segmentIndex, join.segmentT,
+                    junction, sx, sy, axisDiff, forward));
         }
 
-        java.util.Collections.sort(candidates, (a, b) -> Double.compare(a.priority, b.priority));
+        java.util.Collections.sort(candidates, (a, b) -> Double.compare(a.forwardMeters, b.forwardMeters));
 
-        StringBuilder out = new StringBuilder(6200);
+        StringBuilder out = new StringBuilder(7200);
         ArrayList<double[]> emitted = new ArrayList<>();
         int emittedWays = 0;
 
-        for (ScreenRoadStub candidate : candidates) {
+        for (BranchCandidate candidate : candidates) {
+            // Remove only near-identical duplicates created when OSM splits one street
+            // into multiple ways. Different branches at the same junction stay visible.
             boolean duplicate = false;
             for (double[] sig : emitted) {
                 double dx = candidate.screenX - sig[0];
                 double dy = candidate.screenY - sig[1];
-                double ad = axisAngleDiff(candidate.axisBearing, sig[2]);
-                if (dx * dx + dy * dy < 6.0 * 6.0 && ad < 8.0) {
+                double angleDelta = Math.abs(candidate.axisDiffDeg - sig[2]);
+                if (dx * dx + dy * dy < 4.0 * 4.0 && angleDelta < 3.0) {
                     duplicate = true;
                     break;
                 }
             }
             if (duplicate) continue;
 
-            StringBuilder one = new StringBuilder(80);
-            for (LatLon p : candidate.stub) {
-                double east = (p.lon - lon0) * metersPerDegLon;
-                double north = (p.lat - lat0) * metersPerDegLat;
+            ArrayList<LatLon> stub = extractRoadStubAt(candidate.way, candidate.segmentIndex,
+                    candidate.segmentT, CONTEXT_BRANCH_STUB_METERS);
+            if (stub.size() < 2) continue;
+
+            StringBuilder one = new StringBuilder(220);
+            for (LatLon point : stub) {
+                double east = (point.lon - lon0) * metersPerDegLon;
+                double north = (point.lat - lat0) * metersPerDegLat;
                 double right = east * cosH - north * sinH;
                 double forward = east * sinH + north * cosH;
                 double sx = 120.0 + right * pixelsPerMeter;
@@ -1427,7 +1435,7 @@ public class NavigationService extends Service {
             if (one.length() > 0) {
                 if (out.length() > 0) out.append('|');
                 out.append(one);
-                emitted.add(new double[]{candidate.screenX, candidate.screenY, candidate.axisBearing});
+                emitted.add(new double[]{candidate.screenX, candidate.screenY, candidate.axisDiffDeg});
                 emittedWays++;
                 if (emittedWays >= CONTEXT_BRANCH_MAX_VISIBLE) break;
             }
@@ -1436,36 +1444,52 @@ public class NavigationService extends Service {
         return out.toString();
     }
 
-    private static ArrayList<LatLon> shortSegmentAroundMidpoint(LatLon a, LatLon b,
-                                                                 double totalMeters) {
-        ArrayList<LatLon> out = new ArrayList<>();
-        double len = distanceMeters(a.lat, a.lon, b.lat, b.lon);
-        if (len <= 0.01) return out;
-        double halfFraction = Math.min(0.5, (totalMeters * 0.5) / len);
-        double midLat = (a.lat + b.lat) * 0.5;
-        double midLon = (a.lon + b.lon) * 0.5;
-        double dLat = b.lat - a.lat;
-        double dLon = b.lon - a.lon;
-        out.add(new LatLon(midLat - dLat * halfFraction, midLon - dLon * halfFraction));
-        out.add(new LatLon(midLat + dLat * halfFraction, midLon + dLon * halfFraction));
-        return out;
+    private static RoadJoin findClosestRoadJoin(ArrayList<LatLon> way, ArrayList<LatLon> routeWindow) {
+        if (way == null || way.size() < 2 || routeWindow == null || routeWindow.size() < 2) return null;
+
+        double best = Double.POSITIVE_INFINITY;
+        int bestSegment = -1;
+        double bestT = 0.0;
+        int bestRouteIndex = 0;
+        LatLon bestPoint = null;
+
+        for (int i = 0; i < way.size() - 1; i++) {
+            LatLon a = way.get(i);
+            LatLon b = way.get(i + 1);
+            double segMeters = distanceMeters(a.lat, a.lon, b.lat, b.lon);
+            int samples = Math.max(1, Math.min(12, (int) Math.ceil(segMeters / 12.0)));
+
+            for (int s = 0; s <= samples; s++) {
+                double t = (double) s / (double) samples;
+                LatLon point = interpolateLatLon(a, b, t);
+                RouteMatch rm = matchRoute(routeWindow, point.lat, point.lon);
+                if (rm.offMeters < best) {
+                    best = rm.offMeters;
+                    bestSegment = i;
+                    bestT = t;
+                    bestRouteIndex = rm.index;
+                    bestPoint = point;
+                }
+            }
+        }
+
+        if (bestSegment < 0 || bestPoint == null) return null;
+        return new RoadJoin(best, bestSegment, bestT, bestRouteIndex, bestPoint);
     }
 
-    private static class ScreenRoadStub {
-        final ArrayList<LatLon> stub;
-        final double screenX;
-        final double screenY;
-        final double axisBearing;
-        final double priority;
+    private static ArrayList<LatLon> extractRoadStubAt(ArrayList<LatLon> way, int segmentIndex,
+                                                        double segmentT, double maxMetersEachSide) {
+        int seg = Math.max(0, Math.min(segmentIndex, way.size() - 2));
+        double t = Math.max(0.0, Math.min(1.0, segmentT));
 
-        ScreenRoadStub(ArrayList<LatLon> stub, double screenX, double screenY,
-                       double axisBearing, double priority) {
-            this.stub = stub;
-            this.screenX = screenX;
-            this.screenY = screenY;
-            this.axisBearing = axisBearing;
-            this.priority = priority;
-        }
+        if (t <= 0.001) return extractRoadStub(way, seg, maxMetersEachSide);
+        if (t >= 0.999) return extractRoadStub(way, seg + 1, maxMetersEachSide);
+
+        ArrayList<LatLon> expanded = new ArrayList<>();
+        for (int i = 0; i <= seg; i++) expanded.add(way.get(i));
+        expanded.add(interpolateLatLon(way.get(seg), way.get(seg + 1), t));
+        for (int i = seg + 1; i < way.size(); i++) expanded.add(way.get(i));
+        return extractRoadStub(expanded, seg + 1, maxMetersEachSide);
     }
 
     private static double localAxisBearing(ArrayList<LatLon> pts, int index) {
@@ -1545,18 +1569,38 @@ public class NavigationService extends Service {
                 a.lon + (b.lon - a.lon) * clamped);
     }
 
+    static class RoadJoin {
+        final double offMeters;
+        final int segmentIndex;
+        final double segmentT;
+        final int routeIndex;
+        final LatLon point;
+
+        RoadJoin(double offMeters, int segmentIndex, double segmentT, int routeIndex, LatLon point) {
+            this.offMeters = offMeters;
+            this.segmentIndex = segmentIndex;
+            this.segmentT = segmentT;
+            this.routeIndex = routeIndex;
+            this.point = point;
+        }
+    }
+
     static class BranchCandidate {
         final ArrayList<LatLon> way;
-        final int junctionIndex;
+        final int segmentIndex;
+        final double segmentT;
+        final LatLon junction;
         final double screenX;
         final double screenY;
         final double axisDiffDeg;
         final double forwardMeters;
 
-        BranchCandidate(ArrayList<LatLon> way, int junctionIndex, double screenX, double screenY,
-                        double axisDiffDeg, double forwardMeters) {
+        BranchCandidate(ArrayList<LatLon> way, int segmentIndex, double segmentT, LatLon junction,
+                        double screenX, double screenY, double axisDiffDeg, double forwardMeters) {
             this.way = way;
-            this.junctionIndex = junctionIndex;
+            this.segmentIndex = segmentIndex;
+            this.segmentT = segmentT;
+            this.junction = junction;
             this.screenX = screenX;
             this.screenY = screenY;
             this.axisDiffDeg = axisDiffDeg;
@@ -1605,8 +1649,6 @@ public class NavigationService extends Service {
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8");
-        c.setRequestProperty("Accept", "application/json");
-        c.setRequestProperty("User-Agent", "CiaoBeeline/0.36 (Wear OS navigation)");
 
         String query =
                 "[out:json][timeout:5];" +
