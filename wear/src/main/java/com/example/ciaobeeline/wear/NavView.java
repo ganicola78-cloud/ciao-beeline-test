@@ -105,12 +105,11 @@ public class NavView extends View {
         routePaint.setStrokeCap(Paint.Cap.ROUND);
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
-        // V0.34: short junction references, Beeline-style.  They are intentionally
-        // much thinner than the 8 px active route but bright enough to be visible
-        // outdoors at a glance.
+        // V0.35: all useful side-road references are short white stubs.  Keep them
+        // clearly visible but much thinner than the 8 px active route.
         roadPaint.setStyle(Paint.Style.STROKE);
-        roadPaint.setColor(Color.rgb(195, 195, 195));
-        roadPaint.setStrokeWidth(3.2f);
+        roadPaint.setColor(Color.WHITE);
+        roadPaint.setStrokeWidth(2.6f);
         roadPaint.setStrokeCap(Paint.Cap.ROUND);
         roadPaint.setStrokeJoin(Paint.Join.ROUND);
 
