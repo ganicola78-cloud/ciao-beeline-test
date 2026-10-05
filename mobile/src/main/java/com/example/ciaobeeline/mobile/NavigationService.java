@@ -1359,18 +1359,26 @@ public class NavigationService extends Service {
             if (way == null || way.size() < 2) continue;
 
             double bestMeters = Double.POSITIVE_INFINITY;
-            int bestWayIndex = -1;
+            int bestWaySegmentIndex = -1;
             int bestRouteIndex = -1;
+            LatLon bestWayAnchor = null;
+            LatLon bestRouteAnchor = null;
 
-            // Check both vertices and segment mid-points. This is important when an OSM
-            // side street crosses the ORS route between two sparse OSM geometry points.
+            // V0.37: keep the permissive V0.36 selection, but remember BOTH sides of
+            // the visual junction: the closest point on the OSM road and the snapped
+            // point on the active ORS route. This lets us draw the small side-road stub
+            // physically attached to the main white route instead of as a floating mark.
+            // Check vertices and segment mid-points as before so sparse OSM geometries
+            // are still detected reliably.
             for (int wi = 0; wi < way.size(); wi++) {
                 LatLon wp = way.get(wi);
                 RouteMatch rm = matchRoute(routeWindow, wp.lat, wp.lon);
                 if (rm.offMeters < bestMeters) {
                     bestMeters = rm.offMeters;
-                    bestWayIndex = wi;
+                    bestWaySegmentIndex = Math.max(0, Math.min(wi, way.size() - 2));
                     bestRouteIndex = rm.index;
+                    bestWayAnchor = new LatLon(wp.lat, wp.lon);
+                    bestRouteAnchor = new LatLon(rm.lat, rm.lon);
                 }
 
                 if (wi + 1 < way.size()) {
@@ -1380,15 +1388,21 @@ public class NavigationService extends Service {
                     RouteMatch mid = matchRoute(routeWindow, midLat, midLon);
                     if (mid.offMeters < bestMeters) {
                         bestMeters = mid.offMeters;
-                        bestWayIndex = wi;
+                        bestWaySegmentIndex = wi;
                         bestRouteIndex = mid.index;
+                        bestWayAnchor = new LatLon(midLat, midLon);
+                        bestRouteAnchor = new LatLon(mid.lat, mid.lon);
                     }
                 }
             }
 
-            if (bestWayIndex < 0 || bestRouteIndex < 0 || bestMeters > CONTEXT_BRANCH_JOIN_METERS) continue;
+            if (bestWaySegmentIndex < 0 || bestRouteIndex < 0 || bestWayAnchor == null ||
+                    bestRouteAnchor == null || bestMeters > CONTEXT_BRANCH_JOIN_METERS) continue;
 
-            LatLon junction = way.get(bestWayIndex);
+            // Place/deduplicate the branch at the ROUTE junction. The OSM stub will be
+            // translated by the small OSM->ORS offset below, so its anchor lands exactly
+            // on this point. This is the key V0.37 visual fix.
+            LatLon junction = bestRouteAnchor;
             double east = (junction.lon - lon0) * metersPerDegLon;
             double north = (junction.lat - lat0) * metersPerDegLat;
             double right = east * cosH - north * sinH;
@@ -1398,7 +1412,10 @@ public class NavigationService extends Service {
                     forward > CONTEXT_BRANCH_MAX_AHEAD_METERS) continue;
             if (Math.abs(right) > 145.0) continue;
 
-            double wayAxis = localAxisBearing(way, bestWayIndex);
+            double wayAxis = bearing(way.get(bestWaySegmentIndex).lat,
+                    way.get(bestWaySegmentIndex).lon,
+                    way.get(bestWaySegmentIndex + 1).lat,
+                    way.get(bestWaySegmentIndex + 1).lon);
             double routeAxis = localAxisBearing(routeWindow, bestRouteIndex);
             double axisDiff = axisAngleDiff(wayAxis, routeAxis);
 
@@ -1411,7 +1428,8 @@ public class NavigationService extends Service {
             double sy = 164.0 - forward * pixelsPerMeter;
             if (sx < -18.0 || sx > 258.0 || sy < -18.0 || sy > 205.0) continue;
 
-            candidates.add(new BranchCandidate(way, bestWayIndex, sx, sy, axisDiff, forward));
+            candidates.add(new BranchCandidate(way, bestWaySegmentIndex, bestWayAnchor,
+                    bestRouteAnchor, sx, sy, axisDiff, forward));
         }
 
         java.util.Collections.sort(candidates, (a, b) -> Double.compare(a.forwardMeters, b.forwardMeters));
@@ -1432,14 +1450,24 @@ public class NavigationService extends Service {
             }
             if (duplicate) continue;
 
-            ArrayList<LatLon> stub = extractRoadStub(candidate.way, candidate.junctionIndex,
-                    CONTEXT_BRANCH_STUB_METERS);
+            ArrayList<LatLon> stub = extractRoadStub(candidate.way, candidate.waySegmentIndex,
+                    candidate.wayAnchor, CONTEXT_BRANCH_STUB_METERS);
             if (stub.size() < 2) continue;
+
+            // Translate the short OSM stub so its junction anchor coincides exactly with
+            // the ORS route. Only the tiny context stub moves; navigation geometry and
+            // routing logic remain untouched. Drawing context first on the watch means
+            // the thick 8 px route naturally covers the join and keeps the main road
+            // dominant, while the thinner side roads visibly emerge from it.
+            double snapDeltaLat = candidate.routeAnchor.lat - candidate.wayAnchor.lat;
+            double snapDeltaLon = candidate.routeAnchor.lon - candidate.wayAnchor.lon;
 
             StringBuilder one = new StringBuilder(220);
             for (LatLon p : stub) {
-                double east = (p.lon - lon0) * metersPerDegLon;
-                double north = (p.lat - lat0) * metersPerDegLat;
+                double snappedLat = p.lat + snapDeltaLat;
+                double snappedLon = p.lon + snapDeltaLon;
+                double east = (snappedLon - lon0) * metersPerDegLon;
+                double north = (snappedLat - lat0) * metersPerDegLat;
                 double right = east * cosH - north * sinH;
                 double forward = east * sinH + north * cosH;
                 double sx = 120.0 + right * pixelsPerMeter;
@@ -1478,54 +1506,58 @@ public class NavigationService extends Service {
         return Math.abs(d);
     }
 
-    private static ArrayList<LatLon> extractRoadStub(ArrayList<LatLon> way, int junctionIndex,
-                                                     double maxMetersEachSide) {
+    private static ArrayList<LatLon> extractRoadStub(ArrayList<LatLon> way, int anchorSegmentIndex,
+                                                     LatLon anchor, double maxMetersEachSide) {
         ArrayList<LatLon> before = new ArrayList<>();
         ArrayList<LatLon> after = new ArrayList<>();
-        int j = Math.max(0, Math.min(junctionIndex, way.size() - 1));
-        LatLon junction = way.get(j);
-        before.add(junction);
+        if (way == null || way.size() < 2 || anchor == null) return before;
 
+        int seg = Math.max(0, Math.min(anchorSegmentIndex, way.size() - 2));
+        before.add(anchor);
+
+        // Walk from the arbitrary anchor point backwards along the OSM way. This works
+        // both when the best match is an actual OSM vertex and when V0.36 found the
+        // junction at a segment midpoint.
         double walked = 0.0;
-        LatLon from = junction;
-        for (int i = j - 1; i >= 0; i--) {
+        LatLon from = anchor;
+        for (int i = seg; i >= 0; i--) {
             LatLon to = way.get(i);
-            double seg = distanceMeters(from.lat, from.lon, to.lat, to.lon);
-            if (seg <= 0.01) {
+            double segMeters = distanceMeters(from.lat, from.lon, to.lat, to.lon);
+            if (segMeters <= 0.01) {
                 from = to;
                 continue;
             }
-            if (walked + seg <= maxMetersEachSide) {
+            if (walked + segMeters <= maxMetersEachSide) {
                 before.add(to);
-                walked += seg;
+                walked += segMeters;
                 from = to;
             } else {
                 double remain = maxMetersEachSide - walked;
-                if (remain > 0.5) before.add(interpolateLatLon(from, to, remain / seg));
+                if (remain > 0.5) before.add(interpolateLatLon(from, to, remain / segMeters));
                 break;
             }
         }
 
-        // Reverse the backward half so the polyline flows naturally into the junction.
         ArrayList<LatLon> out = new ArrayList<>();
         for (int i = before.size() - 1; i >= 0; i--) out.add(before.get(i));
 
+        // And forwards from the same anchor. Do not add the anchor twice.
         walked = 0.0;
-        from = junction;
-        for (int i = j + 1; i < way.size(); i++) {
+        from = anchor;
+        for (int i = seg + 1; i < way.size(); i++) {
             LatLon to = way.get(i);
-            double seg = distanceMeters(from.lat, from.lon, to.lat, to.lon);
-            if (seg <= 0.01) {
+            double segMeters = distanceMeters(from.lat, from.lon, to.lat, to.lon);
+            if (segMeters <= 0.01) {
                 from = to;
                 continue;
             }
-            if (walked + seg <= maxMetersEachSide) {
+            if (walked + segMeters <= maxMetersEachSide) {
                 after.add(to);
-                walked += seg;
+                walked += segMeters;
                 from = to;
             } else {
                 double remain = maxMetersEachSide - walked;
-                if (remain > 0.5) after.add(interpolateLatLon(from, to, remain / seg));
+                if (remain > 0.5) after.add(interpolateLatLon(from, to, remain / segMeters));
                 break;
             }
         }
@@ -1541,16 +1573,21 @@ public class NavigationService extends Service {
 
     static class BranchCandidate {
         final ArrayList<LatLon> way;
-        final int junctionIndex;
+        final int waySegmentIndex;
+        final LatLon wayAnchor;
+        final LatLon routeAnchor;
         final double screenX;
         final double screenY;
         final double axisDiffDeg;
         final double forwardMeters;
 
-        BranchCandidate(ArrayList<LatLon> way, int junctionIndex, double screenX, double screenY,
+        BranchCandidate(ArrayList<LatLon> way, int waySegmentIndex, LatLon wayAnchor,
+                        LatLon routeAnchor, double screenX, double screenY,
                         double axisDiffDeg, double forwardMeters) {
             this.way = way;
-            this.junctionIndex = junctionIndex;
+            this.waySegmentIndex = waySegmentIndex;
+            this.wayAnchor = wayAnchor;
+            this.routeAnchor = routeAnchor;
             this.screenX = screenX;
             this.screenY = screenY;
             this.axisDiffDeg = axisDiffDeg;
