@@ -105,20 +105,23 @@ public class NavigationService extends Service {
     private static final long FRESH_GPS_PRIORITY_MS = 2500;
     private static final long NOTIFICATION_REFRESH_MS = 2000;
     private static final long CONTEXT_ROADS_REFRESH_MS = 35000;
-    private static final long CONTEXT_ROADS_MIN_REFRESH_MS = 15000;
+    // V0.38: if the OSM context request fails/returns empty, allow a fast retry.
+    // A 15 s hard minimum made the watch look permanently without side roads when
+    // the first Overpass request happened on a weak mobile connection.
+    private static final long CONTEXT_ROADS_MIN_REFRESH_MS = 5000;
     private static final double CONTEXT_ROADS_REFRESH_DISTANCE_M = 160.0;
-    private static final double CONTEXT_ROADS_QUERY_RADIUS_M = 420.0;
+    private static final double CONTEXT_ROADS_QUERY_RADIUS_M = 520.0;
 
     // V0.36: side-road references are intentionally permissive and visual.
     // Instead of requiring an exact OSM/ORS junction match, every nearby OSM road
     // that comes close to the visible route can contribute a short stub. This makes
     // the little "cross street" marks reliably visible on the Carlyle.
-    private static final double CONTEXT_BRANCH_JOIN_METERS = 55.0;
-    private static final double CONTEXT_BRANCH_STUB_METERS = 20.0;
+    private static final double CONTEXT_BRANCH_JOIN_METERS = 70.0;
+    private static final double CONTEXT_BRANCH_STUB_METERS = 24.0;
     private static final double CONTEXT_BRANCH_MIN_AXIS_ANGLE_DEG = 5.0;
-    private static final double CONTEXT_BRANCH_MAX_AHEAD_METERS = 205.0;
-    private static final double CONTEXT_BRANCH_ALLOW_BEHIND_METERS = 18.0;
-    private static final int CONTEXT_BRANCH_MAX_VISIBLE = 36;
+    private static final double CONTEXT_BRANCH_MAX_AHEAD_METERS = 220.0;
+    private static final double CONTEXT_BRANCH_ALLOW_BEHIND_METERS = 22.0;
+    private static final int CONTEXT_BRANCH_MAX_VISIBLE = 40;
     // V0.21: keep the ORS geometry dense enough to preserve roundabouts and tight bends.
     // The base zoom is intentionally a little closer than V0.20; near a roundabout
     // we zoom in further so the individual exits remain distinguishable on 240x240.
@@ -1205,9 +1208,15 @@ public class NavigationService extends Service {
                         contextRoads.clear();
                         contextRoads.addAll(result);
                     }
-                    // Push the newly available grey road context to the Carlyle without
+                    // Push the newly available road context to the Carlyle without
                     // waiting for the next GPS callback.
                     if (running) sendNavUpdate(false);
+                } else {
+                    // V0.38: do not pin an empty/failed request to this position for
+                    // 35 seconds. Mark the centre as unresolved so the next heartbeat
+                    // can retry after CONTEXT_ROADS_MIN_REFRESH_MS.
+                    lastContextRoadsLat = Double.NaN;
+                    lastContextRoadsLon = Double.NaN;
                 }
             });
         }).start();
@@ -1219,7 +1228,8 @@ public class NavigationService extends Service {
         // treated as a valid rural-area result.
         String[] endpoints = new String[]{
                 "https://overpass-api.de/api/interpreter",
-                "https://overpass.kumi.systems/api/interpreter"
+                "https://overpass.kumi.systems/api/interpreter",
+                "https://overpass.private.coffee/api/interpreter"
         };
         Exception last = null;
         for (String endpoint : endpoints) {
@@ -1237,13 +1247,15 @@ public class NavigationService extends Service {
             String endpoint, double lat, double lon) throws Exception {
         URL url = new URL(endpoint);
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
-        c.setConnectTimeout(5000);
-        c.setReadTimeout(6500);
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(12000);
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=utf-8");
+        c.setRequestProperty("Accept", "application/json");
+        c.setRequestProperty("User-Agent", "CiaoBeeline/0.38 Android");
 
-        String highwayRegex = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|living_street|service|unclassified|road|track";
+        String highwayRegex = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|living_street|service|unclassified|road|track|pedestrian";
         String query = "[out:json][timeout:5];" +
                 "way(around:" + (int) CONTEXT_ROADS_QUERY_RADIUS_M + "," + lat + "," + lon + ")" +
                 "[\"highway\"~\"^(" + highwayRegex + ")$\"];" +
@@ -1267,7 +1279,7 @@ public class NavigationService extends Service {
         // V0.36: parse a broad set first, then keep the roads spatially closest to the
         // rider. Overpass element order is arbitrary; limiting before sorting could drop
         // the exact cross streets visible on screen.
-        for (int i = 0; i < elements.length() && out.size() < 260; i++) {
+        for (int i = 0; i < elements.length() && out.size() < 700; i++) {
             JSONObject e = elements.optJSONObject(i);
             if (e == null) continue;
             JSONArray geometry = e.optJSONArray("geometry");
@@ -1290,8 +1302,8 @@ public class NavigationService extends Service {
 
         java.util.Collections.sort(out, (a, b) -> Double.compare(
                 minDistanceToWay(lat, lon, a), minDistanceToWay(lat, lon, b)));
-        if (out.size() > 140) {
-            return new ArrayList<>(out.subList(0, 140));
+        if (out.size() > 220) {
+            return new ArrayList<>(out.subList(0, 220));
         }
         return out;
     }
@@ -1364,34 +1376,25 @@ public class NavigationService extends Service {
             LatLon bestWayAnchor = null;
             LatLon bestRouteAnchor = null;
 
-            // V0.37: keep the permissive V0.36 selection, but remember BOTH sides of
-            // the visual junction: the closest point on the OSM road and the snapped
-            // point on the active ORS route. This lets us draw the small side-road stub
-            // physically attached to the main white route instead of as a floating mark.
-            // Check vertices and segment mid-points as before so sparse OSM geometries
-            // are still detected reliably.
-            for (int wi = 0; wi < way.size(); wi++) {
-                LatLon wp = way.get(wi);
-                RouteMatch rm = matchRoute(routeWindow, wp.lat, wp.lon);
-                if (rm.offMeters < bestMeters) {
-                    bestMeters = rm.offMeters;
-                    bestWaySegmentIndex = Math.max(0, Math.min(wi, way.size() - 2));
-                    bestRouteIndex = rm.index;
-                    bestWayAnchor = new LatLon(wp.lat, wp.lon);
-                    bestRouteAnchor = new LatLon(rm.lat, rm.lon);
-                }
-
-                if (wi + 1 < way.size()) {
-                    LatLon np = way.get(wi + 1);
-                    double midLat = (wp.lat + np.lat) * 0.5;
-                    double midLon = (wp.lon + np.lon) * 0.5;
-                    RouteMatch mid = matchRoute(routeWindow, midLat, midLon);
-                    if (mid.offMeters < bestMeters) {
-                        bestMeters = mid.offMeters;
+            // V0.38: sample every OSM segment at 0/25/50/75/100%. V0.37 checked
+            // only vertices and the midpoint; with a long straight OSM segment an
+            // actual intersection could lie near one quarter of the segment and be
+            // missed completely. This is deliberately still lightweight compared
+            // with a full segment-to-segment intersection test.
+            final double[] samples = new double[]{0.0, 0.25, 0.50, 0.75, 1.0};
+            for (int wi = 0; wi + 1 < way.size(); wi++) {
+                LatLon a = way.get(wi);
+                LatLon b = way.get(wi + 1);
+                for (double t : samples) {
+                    double sampleLat = a.lat + (b.lat - a.lat) * t;
+                    double sampleLon = a.lon + (b.lon - a.lon) * t;
+                    RouteMatch rm = matchRoute(routeWindow, sampleLat, sampleLon);
+                    if (rm.offMeters < bestMeters) {
+                        bestMeters = rm.offMeters;
                         bestWaySegmentIndex = wi;
-                        bestRouteIndex = mid.index;
-                        bestWayAnchor = new LatLon(midLat, midLon);
-                        bestRouteAnchor = new LatLon(mid.lat, mid.lon);
+                        bestRouteIndex = rm.index;
+                        bestWayAnchor = new LatLon(sampleLat, sampleLon);
+                        bestRouteAnchor = new LatLon(rm.lat, rm.lon);
                     }
                 }
             }
