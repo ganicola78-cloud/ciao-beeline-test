@@ -105,12 +105,11 @@ public class NavView extends View {
         routePaint.setStrokeCap(Paint.Cap.ROUND);
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
-        // V0.36: side-road references are intentionally easy to see on the Carlyle.
-        // They remain much thinner than the 8 px active route, but are thick enough
-        // to be readable outdoors and on the round low-resolution display.
+        // V0.38: side-road references stay visible but deliberately lighter than the
+        // 8 px route, matching the requested Beeline-like visual hierarchy.
         roadPaint.setStyle(Paint.Style.STROKE);
         roadPaint.setColor(Color.WHITE);
-        roadPaint.setStrokeWidth(3.6f);
+        roadPaint.setStrokeWidth(3.0f);
         roadPaint.setStrokeCap(Paint.Cap.ROUND);
         roadPaint.setStrokeJoin(Paint.Join.ROUND);
 
